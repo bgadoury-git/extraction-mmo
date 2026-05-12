@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# Multi-stage build for the game-server binary.
+# Build flags: --no-default-features --features server  (headless, no Bevy renderer)
+
+# -- Stage 1: cargo-chef base ----------------------------------------------
+FROM rust:slim-bookworm AS chef
+# System deps for Bevy (audio/input crates have C build scripts) + git for
+# the avian2d git dependency + cmake for aws-lc-sys if pulled transitively.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    cmake \
+    git \
+    libasound2-dev \
+    libudev-dev \
+    libxkbcommon-dev \
+    libwayland-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef --locked
+WORKDIR /workspace
+
+# -- Stage 2: dependency planner -------------------------------------------
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# -- Stage 3: dependency cache ---------------------------------------------
+FROM chef AS builder
+COPY --from=planner /workspace/recipe.json recipe.json
+# Flags must match the final cargo build to maximise layer cache hits.
+RUN cargo chef cook --release --no-default-features --features server -p game --recipe-path recipe.json
+
+# -- Stage 4: build the game-server binary ---------------------------------
+COPY . .
+RUN cargo build --release --no-default-features --features server -p game
+
+# -- Stage 5: minimal runtime image ----------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /workspace/target/release/game /usr/local/bin/game-server
+
+# Runtime env � all overridden by the orchestrator when spawning containers.
+ENV SERVER_ID=""
+ENV QUIC_PORT=7000
+ENV MAX_PLAYERS=128
+ENV REDIS_URL="redis://redis:6379"
+ENV GATEKEEPER_ADDR="gatekeeper:3001"
+
+EXPOSE ${QUIC_PORT}/udp
+CMD ["/usr/local/bin/game-server"]

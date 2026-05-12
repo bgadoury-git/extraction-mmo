@@ -1,0 +1,93 @@
+# docker-compose.yml
+# Static services only. The `game-server` service is intentionally excluded
+# from `up` (profiles: [build-only]); the orchestrator spawns game containers
+# dynamically at runtime on the game-net bridge network.
+
+networks:
+  game-net:
+    driver: bridge
+    name: game-net  # explicit name so bollard can reference it by this exact string
+
+volumes:
+  redis-data:
+  certs:
+    name: extraction-mmo-certs  # explicit name passed to orchestrator as CERTS_VOLUME
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    networks:
+      - game-net
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Gatekeeper ────────────────────────────────────────────────────────────
+  # HTTP REST on :3000 (client login/dispatch) + internal QUIC on :3001
+  # (token validation requests from game servers).
+  gatekeeper:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.gatekeeper
+    image: gatekeeper:latest
+    networks:
+      - game-net
+    ports:
+      - "3000:3000"   # expose HTTP to the host for client connections
+    environment:
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - certs:/certs:ro  # reads CA cert written by the first game-server boot
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Orchestrator ──────────────────────────────────────────────────────────
+  # Manages game-server container lifecycle via the Docker socket.
+  orchestrator:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.orchestrator
+    image: orchestrator:latest
+    networks:
+      - game-net
+    environment:
+      REDIS_URL: redis://redis:6379
+      GATEKEEPER_ADDR: gatekeeper:3001
+      GAME_IMAGE: game-server:latest
+      GAME_NETWORK: game-net
+      CERTS_VOLUME: extraction-mmo-certs
+      QUIC_PORT_RANGE_START: "7000"
+      QUIC_PORT_RANGE_END: "7100"
+      PUBLIC_ADDR: "localhost"   # address clients use to reach spawned game servers
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker API access
+      - certs:/certs                               # writes self-signed CA on first boot
+    depends_on:
+      redis:
+        condition: service_healthy
+      gatekeeper:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Game Server (build target only) ───────────────────────────────────────
+  # NOT started by `docker compose up`. Exists solely so that
+  # `docker compose build game-server` builds and tags the image that the
+  # orchestrator spawns at runtime.
+  game-server:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.game
+    image: game-server:latest
+    profiles:
+      - build-only

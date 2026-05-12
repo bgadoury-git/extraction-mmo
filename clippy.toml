@@ -1,0 +1,15 @@
+[lints.clippy]
+# correctness
+pedantic = { level = "warn", priority = -1 }
+
+# allow common false-positive pedantic lints
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+wildcard_imports = "allow"
+
+# style
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+unwrap_used = "warn"

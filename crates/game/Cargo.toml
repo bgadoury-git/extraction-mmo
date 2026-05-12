@@ -1,0 +1,37 @@
+[package]
+name = "game"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "game"
+path = "src/main.rs"
+
+[features]
+default = ["client"]
+dev-dynamic = ["bevy/dynamic_linking"]
+client = ["dep:reqwest", "dep:quinn", "dep:rustls", "dep:tokio"]
+server = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:deadpool-redis", "dep:tokio", "dep:tracing-subscriber", "dep:uuid"]
+
+[dependencies]
+common         = { workspace = true }
+bevy           = { workspace = true }
+avian2d        = { workspace = true }
+serde          = { workspace = true }
+bitcode        = { workspace = true }
+tracing        = { workspace = true }
+anyhow         = { workspace = true }
+futures-lite   = "2"
+bytes          = { workspace = true }
+
+# client-only
+reqwest        = { workspace = true, optional = true }
+
+# server-only
+quinn          = { workspace = true, optional = true }
+rustls         = { workspace = true, optional = true }
+rcgen          = { workspace = true, optional = true }
+deadpool-redis = { workspace = true, optional = true }
+tokio          = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+uuid           = { workspace = true, optional = true }

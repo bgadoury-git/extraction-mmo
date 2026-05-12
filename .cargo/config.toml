@@ -1,0 +1,12 @@
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1
+
+# High opt-level for deps even in dev builds (Bevy benefits greatly from this)
+[profile.dev.package."*"]
+opt-level = 3

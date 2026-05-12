@@ -1,0 +1,17 @@
+[package]
+name = "stress"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common            = { workspace = true }
+tokio             = { workspace = true }
+reqwest           = { workspace = true }
+quinn             = { workspace = true }
+rustls            = { workspace = true }
+bitcode           = { workspace = true }
+bytes             = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde             = { workspace = true }

@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/common",
+    "crates/game",
+    "crates/gatekeeper",
+    "crates/orchestrator",
+    "crates/stress",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# internal crates
+common = { path = "crates/common" }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+bitcode = { version = "0.6", features = ["serde"] }
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# networking
+axum = "0.8"
+quinn = "0.11"
+rustls = { version = "0.23", features = ["ring"] }
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# database
+deadpool-redis = "0.18"
+
+# docker
+bollard = "0.18"
+
+# bevy
+bevy = { version = "0.18.1" }
+avian2d = { git = "https://github.com/avianphysics/avian", branch = "main", default-features = false, features = ["2d", "f32", "parry-f32", "xpbd_joints", "parallel"] }
+
+# utilities
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+bytes = "1"
