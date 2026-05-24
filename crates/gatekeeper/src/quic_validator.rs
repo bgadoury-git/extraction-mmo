@@ -8,8 +8,8 @@ use common::packets::{TokenInvalid, TokenValid, ValidateToken, ValidationRespons
 
 use crate::{redis_ops, AppState};
 
-pub async fn run(state: AppState) -> anyhow::Result<()> {
-    let endpoint = make_server_endpoint().context("failed to build QUIC endpoint")?;
+pub async fn run(state: AppState, certs: crate::cert_manager::GatekeeperCerts) -> anyhow::Result<()> {
+    let endpoint = make_server_endpoint(certs).context("failed to build QUIC endpoint")?;
     tracing::info!("QUIC validator listening on 0.0.0.0:3001");
 
     while let Some(incoming) = endpoint.accept().await {
@@ -28,15 +28,9 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
 // TLS / endpoint setup
 // ---------------------------------------------------------------------------
 
-fn make_server_endpoint() -> anyhow::Result<Endpoint> {
-    let certified_key =
-        rcgen::generate_simple_self_signed(vec!["gatekeeper".to_string(), "localhost".to_string()])
-            .context("rcgen generate_simple_self_signed")?;
-
-    let cert_der = CertificateDer::from(certified_key.cert.der().to_vec());
-    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        certified_key.key_pair.serialize_der(),
-    ));
+fn make_server_endpoint(certs: crate::cert_manager::GatekeeperCerts) -> anyhow::Result<Endpoint> {
+    let cert_der = CertificateDer::from(certs.cert_der);
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certs.key_der));
 
     let server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()

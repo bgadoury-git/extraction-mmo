@@ -24,11 +24,8 @@ pub async fn run_health_checks(pool: &deadpool_redis::Pool) -> anyhow::Result<()
 
             let pool = pool.clone();
         tasks.push(tokio::spawn(async move {
-            // The game-server container is always named and aliased as
-            // "game-{server_id}" on game-net — derive the internal host
-            // directly rather than reading it from Redis.
-            let internal_host = format!("game-{}", server.id);
-            let addr = format!("{}:{}", internal_host, server.quic_port);
+            // Use the ClusterIP stored in Redis as internal_addr for health checks.
+            let addr = format!("{}:{}", server.internal_addr, server.quic_port);
             let alive = ping_quic(&addr).await;
 
             // Scope the mutex lock so it is dropped before any await.

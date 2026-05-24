@@ -29,8 +29,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # database
 deadpool-redis = "0.18"
 
-# docker
-bollard = "0.18"
+# kubernetes
+kube = { version = "0.99", features = ["client", "rustls-tls"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # bevy
 bevy = { version = "0.18.1" }

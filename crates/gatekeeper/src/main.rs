@@ -1,3 +1,4 @@
+mod cert_manager;
 mod quic_validator;
 mod redis_ops;
 mod routes;
@@ -27,6 +28,16 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Connect to K8s API and ensure the TLS cert Secret exists.
+    // On first deploy: generates CA + leaf certs and creates the Secret.
+    // On restart: reads the stable certs from the existing Secret.
+    let k8s = kube::Client::try_default()
+        .await
+        .expect("failed to create Kubernetes client");
+    let certs = cert_manager::ensure_certs(&k8s)
+        .await
+        .expect("failed to ensure TLS certs");
+
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://redis:6379".to_string());
 
@@ -37,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the internal QUIC validator on port 3001 (game server → gatekeeper).
     let quic_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = quic_validator::run(quic_state).await {
+        if let Err(e) = quic_validator::run(quic_state, certs).await {
             tracing::error!("QUIC validator crashed: {e:#}");
         }
     });

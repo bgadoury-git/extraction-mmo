@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gatekeeper-http
+  namespace: extraction-mmo
+spec:
+  type: LoadBalancer
+  selector:
+    app: gatekeeper
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP

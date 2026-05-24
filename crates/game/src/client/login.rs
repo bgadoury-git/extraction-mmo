@@ -1,3 +1,5 @@
+use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task};
 use futures_lite::future;
@@ -10,12 +12,28 @@ pub struct LoginPlugin;
 impl Plugin for LoginPlugin {
     fn build(&self, app: &mut App) {
         app
+            .init_resource::<NameBuffer>()
             .add_systems(OnEnter(GameState::Login), setup_login_ui)
             .add_systems(OnExit(GameState::Login), teardown_login_ui)
             .add_systems(
                 Update,
-                (handle_join_button, poll_join_task).run_if(in_state(GameState::Login)),
+                (handle_join_button, poll_join_task, handle_text_input)
+                    .run_if(in_state(GameState::Login)),
             );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// Tracks the name the player is typing in the login UI.
+#[derive(Resource)]
+pub struct NameBuffer(pub String);
+
+impl Default for NameBuffer {
+    fn default() -> Self {
+        Self("Player1".to_string())
     }
 }
 
@@ -84,9 +102,9 @@ fn setup_login_ui(mut commands: Commands) {
                 TextFont { font_size: 40.0, ..default() },
             ));
 
-            // Name input placeholder (static text — full text input needs bevy_ui_text_input)
+            // Name input — updated by handle_text_input via keyboard events
             parent.spawn((
-                Text::new("Enter name: Player1"),
+                Text::new("Player1_"),
                 TextFont { font_size: 24.0, ..default() },
                 NameInput,
             ));
@@ -129,7 +147,7 @@ fn teardown_login_ui(mut commands: Commands, roots: Query<Entity, With<LoginRoot
 fn handle_join_button(
     mut commands: Commands,
     interaction_query: Query<&Interaction, (Changed<Interaction>, With<JoinButton>)>,
-    name_query: Query<&Text, With<NameInput>>,
+    name_buf: Res<NameBuffer>,
     mut status_query: Query<&mut Text, (With<StatusText>, Without<NameInput>)>,
     gatekeeper_url: Option<Res<GatekeeperUrl>>,
 ) {
@@ -138,10 +156,7 @@ fn handle_join_button(
             continue;
         }
 
-        let display_name = name_query
-            .single()
-            .map(|t| t.0.replace("Enter name: ", "").trim().to_string())
-            .unwrap_or_else(|_| "Player1".to_string());
+        let display_name = name_buf.0.trim().to_string();
 
         if display_name.is_empty() {
             if let Ok(mut text) = status_query.single_mut() {
@@ -216,3 +231,41 @@ fn poll_join_task(
 /// Optional resource to override the gatekeeper base URL (e.g. from env).
 #[derive(Resource)]
 pub struct GatekeeperUrl(pub String);
+
+// ---------------------------------------------------------------------------
+// Keyboard text input
+// ---------------------------------------------------------------------------
+
+fn handle_text_input(
+    mut keyboard_events: MessageReader<KeyboardInput>,
+    mut name_buf: ResMut<NameBuffer>,
+    mut name_query: Query<&mut Text, With<NameInput>>,
+) {
+    let mut changed = false;
+    for event in keyboard_events.read() {
+        if event.state != ButtonState::Pressed {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Character(c) => {
+                for ch in c.chars() {
+                    // Filter out non-printable characters.
+                    if !ch.is_control() {
+                        name_buf.0.push(ch);
+                        changed = true;
+                    }
+                }
+            }
+            Key::Backspace => {
+                name_buf.0.pop();
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    if changed {
+        if let Ok(mut text) = name_query.single_mut() {
+            text.0 = format!("{}_", name_buf.0);
+        }
+    }
+}

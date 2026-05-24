@@ -33,6 +33,9 @@ pub fn run() {
     // Required when multiple providers are available (ring + aws-lc-rs via reqwest).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    let gatekeeper_url = std::env::var("GATEKEEPER_URL")
+        .unwrap_or_else(|_| "http://20.104.144.109:3000".to_string());
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -44,6 +47,7 @@ pub fn run() {
         }))
         .add_plugins(avian2d::PhysicsPlugins::default())
         .init_state::<GameState>()
+        .insert_resource(login::GatekeeperUrl(gatekeeper_url))
         .add_plugins(LoginPlugin)
         .add_plugins(ClientNetPlugin)
         .add_plugins(ClientInputPlugin)

@@ -38,7 +38,7 @@ COPY --from=builder /workspace/target/release/orchestrator /usr/local/bin/orches
 # Configurable via docker-compose env (see docker-compose.yml for defaults).
 ENV REDIS_URL="redis://redis:6379"
 ENV GATEKEEPER_ADDR="gatekeeper:3001"
-ENV GAME_IMAGE="game-server:latest"
+ENV GAME_IMAGE="game-server_infonuagique:latest"
 ENV GAME_NETWORK="game-net"
 ENV CERTS_VOLUME="extraction-mmo-certs"
 ENV QUIC_PORT_RANGE_START=7000

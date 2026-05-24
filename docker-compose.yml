@@ -38,7 +38,7 @@ services:
     build:
       context: .
       dockerfile: dockerfiles/Dockerfile.gatekeeper
-    image: gatekeeper:latest
+    image: gatekeeper_infonuagique:latest
     networks:
       - game-net
     ports:
@@ -58,13 +58,13 @@ services:
     build:
       context: .
       dockerfile: dockerfiles/Dockerfile.orchestrator
-    image: orchestrator:latest
+    image: orchestrator_infonuagique:latest
     networks:
       - game-net
     environment:
       REDIS_URL: redis://redis:6379
       GATEKEEPER_ADDR: gatekeeper:3001
-      GAME_IMAGE: game-server:latest
+      GAME_IMAGE: game-server_infonuagique:latest
       GAME_NETWORK: game-net
       CERTS_VOLUME: extraction-mmo-certs
       QUIC_PORT_RANGE_START: "7000"
@@ -88,6 +88,6 @@ services:
     build:
       context: .
       dockerfile: dockerfiles/Dockerfile.game
-    image: game-server:latest
+    image: game-server_infonuagique:latest
     profiles:
       - build-only

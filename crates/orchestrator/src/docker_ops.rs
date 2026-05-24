@@ -13,7 +13,7 @@ use crate::redis_ops;
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn game_image() -> String {
-    std::env::var("GAME_IMAGE").unwrap_or_else(|_| "game-server:latest".to_string())
+    std::env::var("GAME_IMAGE").unwrap_or_else(|_| "game-server_infonuagique:latest".to_string())
 }
 
 fn game_network() -> String {

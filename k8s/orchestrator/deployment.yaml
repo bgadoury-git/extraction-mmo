@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: extraction-mmo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator
+      containers:
+        - name: orchestrator
+          image: extractionmmoacr.azurecr.io/orchestrator:latest
+          imagePullPolicy: Always
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: GAME_IMAGE
+              value: "extractionmmoacr.azurecr.io/game-server:latest"
+            - name: K8S_NAMESPACE
+              value: "extraction-mmo"
+            - name: CERT_SECRET_NAME
+              value: "extraction-mmo-certs"
+            - name: GATEKEEPER_ADDR
+              value: "gatekeeper-quic:3001"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
