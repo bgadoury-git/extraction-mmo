@@ -92,10 +92,33 @@ pub async fn setup(
 // Redis helpers
 // ---------------------------------------------------------------------------
 
+/// Create a Redis pool, retrying for up to 30 seconds if Redis is not ready.
 fn create_redis_pool(url: &str) -> anyhow::Result<Pool> {
-    RedisConfig::from_url(url)
-        .create_pool(Some(RedisRuntime::Tokio1))
-        .context("deadpool-redis create_pool")
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(30);
+    let mut last_err = None;
+    while start.elapsed() < timeout {
+        match RedisConfig::from_url(url).create_pool(Some(RedisRuntime::Tokio1)) {
+            Ok(pool) => {
+                // Try to get a connection to test if Redis is ready
+                let rt = tokio::runtime::Handle::try_current()
+                    .unwrap_or_else(|_| tokio::runtime::Runtime::new().unwrap().handle().clone());
+                let ready = rt.block_on(async {
+                    pool.get().await.is_ok()
+                });
+                if ready {
+                    return Ok(pool);
+                } else {
+                    last_err = Some(anyhow::anyhow!("Redis pool connection failed"));
+                }
+            }
+            Err(e) => {
+                last_err = Some(e.into());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Timed out waiting for Redis pool")))
 }
 
 async fn register_server(

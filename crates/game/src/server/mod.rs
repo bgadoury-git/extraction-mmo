@@ -68,7 +68,11 @@ pub fn run() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    tracing::info!("Game server starting up...");
+
     let cfg = ServerConfig::from_env();
+    tracing::info!(server_id = %cfg.server_id, quic_port = cfg.quic_port, public_addr = %cfg.public_addr, "Loaded server config");
+
     let rt = Arc::new(Runtime::new().expect("failed to create Tokio runtime"));
 
     // Shared state between async QUIC tasks and Bevy systems.
@@ -77,7 +81,9 @@ pub fn run() {
 
     // Bootstrap: register in Redis as "starting", bind QUIC, then set "ready".
     let quic_server = rt.block_on(async {
-        net::setup(&cfg, conn_list.clone(), cmd_tx).await.expect("QUIC setup failed")
+        let s = net::setup(&cfg, conn_list.clone(), cmd_tx).await.expect("QUIC setup failed");
+        tracing::info!("QUIC server setup complete");
+        s
     });
     let quic_handle = Arc::new(Mutex::new(quic_server));
 

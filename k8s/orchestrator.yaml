@@ -1,0 +1,59 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+spec:
+  selector:
+    app: orchestrator
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: orchestrator_infonuagique:latest
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: GATEKEEPER_ADDR
+              value: "gatekeeper:3001"
+            - name: GAME_IMAGE
+              value: "game-server_infonuagique:latest"
+            - name: GAME_NETWORK
+              value: "game-net"
+            - name: CERTS_VOLUME
+              value: "extraction-mmo-certs"
+            - name: QUIC_PORT_RANGE_START
+              value: "7000"
+            - name: QUIC_PORT_RANGE_END
+              value: "7100"
+            - name: PUBLIC_ADDR
+              value: "localhost"
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: certs
+          emptyDir: {}
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+            type: Socket

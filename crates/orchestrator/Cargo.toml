@@ -20,3 +20,7 @@ tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow       = { workspace = true }
 serde        = { workspace = true }
+## For Kubernetes pod creation
+kube = { version = "0.91", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.22", features = ["v1_26"] }
+serde_json = "1.0"

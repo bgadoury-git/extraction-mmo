@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: C:\Users\Basti\AppData\Local\Microsoft\WinGet\Packages\Kubernetes.kompose_Microsoft.Winget.Source_8wekyb3d8bbwe\kompose.exe convert -f docker-compose.yml -o k8s/
+    kompose.version: 1.38.0 (a8f5d1cbd)
+  labels:
+    io.kompose.service: orchestrator
+  name: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: orchestrator
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: C:\Users\Basti\AppData\Local\Microsoft\WinGet\Packages\Kubernetes.kompose_Microsoft.Winget.Source_8wekyb3d8bbwe\kompose.exe convert -f docker-compose.yml -o k8s/
+        kompose.version: 1.38.0 (a8f5d1cbd)
+      labels:
+        io.kompose.service: orchestrator
+    spec:
+      containers:
+        - env:
+            - name: CERTS_VOLUME
+              value: extraction-mmo-certs
+            - name: GAME_IMAGE
+              value: game-server_infonuagique:latest
+            - name: GAME_NETWORK
+              value: game-net
+            - name: GATEKEEPER_ADDR
+              value: gatekeeper:3001
+            - name: PUBLIC_ADDR
+              value: localhost
+            - name: QUIC_PORT_RANGE_END
+              value: "7100"
+            - name: QUIC_PORT_RANGE_START
+              value: "7000"
+            - name: REDIS_URL
+              value: redis://redis:6379
+          image: orchestrator_infonuagique:latest
+          name: orchestrator
+          volumeMounts:
+            - mountPath: /certs
+              name: certs
+      restartPolicy: Always
+      volumes:
+        - name: certs
+          persistentVolumeClaim:
+            claimName: certs
