@@ -1,0 +1,3114 @@
+crates/commun/Cargo.toml
+    [package]
+    name = "common"
+    version = "0.1.0"
+    edition = "2024"
+
+    [dependencies]
+    serde = { workspace = true }
+    bitcode = { workspace = true }
+
+crates/common/src/constants
+    /// Simulation tick rate in Hz.
+    pub const TICK_RATE_HZ: u32 = 30;
+
+    /// Default maximum players per game server shard.
+    pub const DEFAULT_CAPACITY: u32 = 128;
+
+    /// Fraction of capacity at which the orchestrator spawns a new shard.
+    pub const SPAWN_THRESHOLD: f32 = 0.85;
+
+    /// Spatial interest radius in tiles — only entities within this range receive
+    /// position snapshots for a given player.
+    pub const INTEREST_RADIUS_TILES: u32 = 32;
+
+    /// Minimum movement (in world units) required before a position update is sent.
+    /// Updates with delta below this value are skipped to save bandwidth.
+    pub const POSITION_DELTA_THRESHOLD: f32 = 0.1;
+
+crates/common/src/libs
+    pub mod constants;
+    pub mod packets;
+    pub mod redis_keys;
+
+crates/common/src/packets
+    use bitcode::{Decode, Encode};
+
+    // ---------------------------------------------------------------------------
+    // Unreliable datagrams — sent every tick via QUIC unreliable datagrams.
+    // Only nearby entities (within INTEREST_RADIUS_TILES) are included.
+    // ---------------------------------------------------------------------------
+
+    /// Position and velocity snapshot for a single entity.
+    /// Sent unreliably every tick; dropped packets are simply skipped.
+    /// Entity IDs are u32 — never UUIDs — to keep datagrams small.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct PositionSnapshot {
+        pub entity_id: u32,
+        pub x: f32,
+        pub y: f32,
+        pub vx: f32,
+        pub vy: f32,
+    }
+
+    /// A batch of position snapshots sent to one client per tick.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct PositionBatch {
+        pub tick: u32,
+        pub snapshots: Vec<PositionSnapshot>,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Reliable stream packets — sent over QUIC reliable streams (ordered).
+    // ---------------------------------------------------------------------------
+
+    /// A player connected to the shard.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct PlayerJoined {
+        pub entity_id: u32,
+        pub display_name: String,
+    }
+
+    /// A player disconnected or was removed from the shard.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct PlayerLeft {
+        pub entity_id: u32,
+    }
+
+    /// A player picked up an item.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct ItemPickup {
+        pub entity_id: u32,
+        pub item_id: u32,
+    }
+
+    /// Damage was dealt from one entity to another.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct DamageEvent {
+        pub source: u32,
+        pub target: u32,
+        pub amount: f32,
+    }
+
+    /// The result of a player's extraction attempt.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct ExtractionResult {
+        pub player_id: u32,
+        pub success: bool,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Envelope — top-level reliable packet discriminant.
+    // ---------------------------------------------------------------------------
+
+    /// All reliable stream payloads wrapped in a single enum for framing.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub enum ReliablePacket {
+        PlayerJoined(PlayerJoined),
+        PlayerLeft(PlayerLeft),
+        ItemPickup(ItemPickup),
+        DamageEvent(DamageEvent),
+        ExtractionResult(ExtractionResult),
+    }
+
+    // ---------------------------------------------------------------------------
+    // Auth handshake packets (game server ↔ client)
+    // ---------------------------------------------------------------------------
+
+    /// Sent by the game server to the client after successful authentication.
+    /// Contains the entity ID assigned to this player for this session.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct AuthAck {
+        pub entity_id: u32,
+    }
+
+    /// Player movement input — sent as unreliable datagram from client to server each frame.
+    /// `dx`/`dy` are in the range [-1, 1]; the server normalises and scales by speed.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct PlayerInput {
+        pub dx: f32,
+        pub dy: f32,
+    }
+
+    // ---------------------------------------------------------------------------
+    // Internal QUIC packets (game server ↔ gatekeeper)
+    // ---------------------------------------------------------------------------
+
+    /// Sent by a game server to the gatekeeper to validate a session token.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct ValidateToken {
+        pub token: String,
+    }
+
+    /// Positive validation response from the gatekeeper.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub struct TokenValid {
+        pub server_id: String,
+        pub player_id: u32,
+    }
+
+    /// Negative validation response from the gatekeeper.
+    #[derive(Debug, Clone, Copy, Encode, Decode)]
+    pub struct TokenInvalid;
+
+    /// Discriminated union for gatekeeper validation responses.
+    #[derive(Debug, Clone, Encode, Decode)]
+    pub enum ValidationResponse {
+        Valid(TokenValid),
+        Invalid(TokenInvalid),
+    }
+
+crates/common/src/redis_keys
+    /// Redis key for a game server's metadata hash.
+    /// Fields: `address`, `quic_port`, `player_count`, `capacity`, `status`.
+    pub fn server_key(id: &str) -> String {
+        format!("server:{id}")
+    }
+
+    /// Redis key for the set of active (ready) server IDs.
+    pub fn active_servers_key() -> &'static str {
+        "servers:active"
+    }
+
+    /// Redis key for the string holding the current standby server ID.
+    pub fn standby_server_key() -> &'static str {
+        "servers:standby"
+    }
+
+    /// Redis key for a session token hash.
+    /// Fields: `server_id`, `expires_at`.
+    pub fn session_key(token: &str) -> String {
+        format!("session:{token}")
+    }
+
+
+crates/game/client/input
+    use bevy::prelude::*;
+    use bytes::Bytes;
+
+    use common::packets::PlayerInput;
+
+    use super::net::ServerConnection;
+    use super::GameState;
+
+    pub struct ClientInputPlugin;
+
+    impl Plugin for ClientInputPlugin {
+        fn build(&self, app: &mut App) {
+            app.add_systems(Update, send_input.run_if(in_state(GameState::InGame)));
+        }
+    }
+
+    fn send_input(
+        keys: Res<ButtonInput<KeyCode>>,
+        conn: Option<Res<ServerConnection>>,
+    ) {
+        let Some(conn) = conn else { return };
+
+        let mut dx = 0.0_f32;
+        let mut dy = 0.0_f32;
+        if keys.pressed(KeyCode::ArrowLeft)  || keys.pressed(KeyCode::KeyA) { dx -= 1.0; }
+        if keys.pressed(KeyCode::ArrowRight) || keys.pressed(KeyCode::KeyD) { dx += 1.0; }
+        if keys.pressed(KeyCode::ArrowUp)    || keys.pressed(KeyCode::KeyW) { dy += 1.0; }
+        if keys.pressed(KeyCode::ArrowDown)  || keys.pressed(KeyCode::KeyS) { dy -= 1.0; }
+
+        // Only send when a key is held — avoids spamming zero-input datagrams.
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+
+        let data = Bytes::from(bitcode::encode(&PlayerInput { dx, dy }));
+        if let Err(e) = conn.0.send_datagram(data) {
+            tracing::warn!("send_datagram (input): {e}");
+        }
+    }
+
+crates/game/client/interpolation
+
+use bevy::prelude::*;
+
+use common::constants::POSITION_DELTA_THRESHOLD;
+
+use super::net::{MyEntityId, PositionBatchReceived};
+use super::GameState;
+
+pub struct InterpolationPlugin;
+
+impl Plugin for InterpolationPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .add_systems(OnEnter(GameState::InGame), spawn_floor)
+            .add_systems(
+                Update,
+                (
+                    spawn_remote_players,
+                    interpolate_remote_players,
+                )
+                    .run_if(in_state(GameState::InGame)),
+            );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+/// Tracks a remote (server-side) entity on the client.
+#[derive(Component)]
+pub struct RemotePlayer {
+    pub entity_id: u32,
+    pub target: Vec2,
+    pub prev: Vec2,
+}
+
+// ---------------------------------------------------------------------------
+// Systems
+// ---------------------------------------------------------------------------
+
+/// Marker for entities that belong to the in-game scene.
+#[derive(Component)]
+pub struct GameSceneRoot;
+
+/// Spawn a camera and a visual floor mesh when entering InGame.
+fn spawn_floor(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+) {
+    commands.spawn((Camera2d, GameSceneRoot));
+    commands.spawn((
+        Mesh2d(meshes.add(Rectangle::new(4000.0, 32.0))),
+        MeshMaterial2d(materials.add(ColorMaterial::from_color(Color::srgb(0.25, 0.22, 0.18)))),
+        Transform::from_translation(Vec3::new(0.0, -300.0, 0.0)),
+        GameSceneRoot,
+    ));
+}
+
+/// Spawn a circle for each new entity_id seen in position batches.
+/// Own player is rendered green; other players are blue.
+fn spawn_remote_players(
+    mut commands: Commands,
+    mut events: MessageReader<PositionBatchReceived>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    existing: Query<&RemotePlayer>,
+    my_id: Option<Res<MyEntityId>>,
+) {
+    let my_entity_id = my_id.map(|r| r.0);
+    for batch in events.read() {
+        for snap in &batch.0.snapshots {
+            let already_exists = existing.iter().any(|r| r.entity_id == snap.entity_id);
+            if !already_exists {
+                let pos = Vec2::new(snap.x, snap.y);
+                let is_me = my_entity_id == Some(snap.entity_id);
+                let color = if is_me {
+                    Color::srgb(0.2, 1.0, 0.2) // green = local player
+                } else {
+                    Color::srgb(0.2, 0.6, 1.0) // blue = other players
+                };
+                commands.spawn((
+                    RemotePlayer {
+                        entity_id: snap.entity_id,
+                        target: pos,
+                        prev: pos,
+                    },
+                    Mesh2d(meshes.add(Circle::new(16.0))),
+                    MeshMaterial2d(materials.add(ColorMaterial::from_color(color))),
+                    Transform::from_translation(pos.extend(0.0)),
+                ));
+            }
+        }
+    }
+}
+
+/// Smooth-step each remote player toward its latest received position.
+fn interpolate_remote_players(
+    mut events: MessageReader<PositionBatchReceived>,
+    mut query: Query<(&mut RemotePlayer, &mut Transform)>,
+    time: Res<Time>,
+) {
+    // Apply latest snapshot targets.
+    for batch in events.read() {
+        for snap in &batch.0.snapshots {
+            for (mut remote, _) in &mut query {
+                if remote.entity_id == snap.entity_id {
+                    let new_pos = Vec2::new(snap.x, snap.y);
+                    if (new_pos - remote.target).length() > POSITION_DELTA_THRESHOLD {
+                        remote.prev = remote.target;
+                        remote.target = new_pos;
+                    }
+                }
+            }
+        }
+    }
+
+    // Lerp toward target every frame.
+    let alpha = (time.delta_secs() * 15.0).min(1.0);
+    for (remote, mut transform) in &mut query {
+        let current = transform.translation.truncate();
+        let next = current.lerp(remote.target, alpha);
+        transform.translation = next.extend(transform.translation.z);
+    }
+}
+
+crates/game/client/login
+
+    use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::prelude::*;
+use bevy::tasks::{AsyncComputeTaskPool, Task};
+use futures_lite::future;
+use serde::{Deserialize, Serialize};
+
+use super::{GameSession, GameState};
+
+pub struct LoginPlugin;
+
+impl Plugin for LoginPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .init_resource::<NameBuffer>()
+            .add_systems(OnEnter(GameState::Login), setup_login_ui)
+            .add_systems(OnExit(GameState::Login), teardown_login_ui)
+            .add_systems(
+                Update,
+                (handle_join_button, poll_join_task, handle_text_input)
+                    .run_if(in_state(GameState::Login)),
+            );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// Tracks the name the player is typing in the login UI.
+#[derive(Resource)]
+pub struct NameBuffer(pub String);
+
+impl Default for NameBuffer {
+    fn default() -> Self {
+        Self("Player1".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI markers
+// ---------------------------------------------------------------------------
+
+#[derive(Component)]
+struct LoginRoot;
+
+#[derive(Component)]
+struct NameInput;
+
+#[derive(Component)]
+struct JoinButton;
+
+#[derive(Component)]
+struct StatusText;
+
+// ---------------------------------------------------------------------------
+// Async join task
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct JoinRequest {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct JoinResponse {
+    token: String,
+    server_addr: String,
+    quic_port: u16,
+}
+
+#[derive(Component)]
+struct JoinTask(Task<Result<JoinResponse, String>>);
+
+// ---------------------------------------------------------------------------
+// Systems
+// ---------------------------------------------------------------------------
+
+fn setup_login_ui(mut commands: Commands) {
+    commands.spawn((
+        Camera2d,
+        LoginRoot,
+    ));
+
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(16.0),
+                ..default()
+            },
+            LoginRoot,
+        ))
+        .with_children(|parent| {
+            // Title
+            parent.spawn((
+                Text::new("Extraction MMO"),
+                TextFont { font_size: 40.0, ..default() },
+            ));
+
+            // Name input — updated by handle_text_input via keyboard events
+            parent.spawn((
+                Text::new("Player1_"),
+                TextFont { font_size: 24.0, ..default() },
+                NameInput,
+            ));
+
+            // Join button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        padding: UiRect::all(Val::Px(12.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.2, 0.6, 0.2)),
+                    JoinButton,
+                ))
+                .with_children(|btn| {
+                    btn.spawn((
+                        Text::new("Join"),
+                        TextFont { font_size: 24.0, ..default() },
+                    ));
+                });
+
+            // Status line
+            parent.spawn((
+                Text::new(""),
+                TextFont { font_size: 18.0, ..default() },
+                TextColor(Color::srgb(1.0, 0.4, 0.4)),
+                StatusText,
+            ));
+        });
+}
+
+fn teardown_login_ui(mut commands: Commands, roots: Query<Entity, With<LoginRoot>>) {
+    for entity in &roots {
+        commands.entity(entity).despawn_related::<Children>();
+        commands.entity(entity).despawn();
+    }
+}
+
+fn handle_join_button(
+    mut commands: Commands,
+    interaction_query: Query<&Interaction, (Changed<Interaction>, With<JoinButton>)>,
+    name_buf: Res<NameBuffer>,
+    mut status_query: Query<&mut Text, (With<StatusText>, Without<NameInput>)>,
+    gatekeeper_url: Option<Res<GatekeeperUrl>>,
+) {
+    for interaction in &interaction_query {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+
+        let display_name = name_buf.0.trim().to_string();
+
+        if display_name.is_empty() {
+            if let Ok(mut text) = status_query.single_mut() {
+                text.0 = "Name cannot be empty".to_string();
+            }
+            return;
+        }
+
+        let url = gatekeeper_url
+            .as_ref()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| "http://localhost:3000".to_string());
+
+        let task_pool = AsyncComputeTaskPool::get();
+        let task = task_pool.spawn(async move {
+            // reqwest requires a Tokio runtime; AsyncComputeTaskPool uses async-executor
+            // (no Tokio context), so we build a dedicated single-threaded runtime here.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+
+            rt.block_on(async {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("{url}/join"))
+                    .json(&JoinRequest { display_name })
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                if resp.status().is_success() {
+                    resp.json::<JoinResponse>().await.map_err(|e| e.to_string())
+                } else {
+                    Err(format!("Server returned {}", resp.status()))
+                }
+            })
+        });
+
+        commands.spawn(JoinTask(task));
+    }
+}
+
+fn poll_join_task(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut JoinTask)>,
+    mut status_query: Query<&mut Text, With<StatusText>>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    for (entity, mut task) in &mut tasks {
+        if let Some(result) = future::block_on(future::poll_once(&mut task.0)) {
+            commands.entity(entity).despawn();
+            match result {
+                Ok(resp) => {
+                    commands.insert_resource(GameSession {
+                        token: resp.token,
+                        server_addr: resp.server_addr,
+                        quic_port: resp.quic_port,
+                    });
+                    next_state.set(GameState::Connecting);
+                }
+                Err(e) => {
+                    if let Ok(mut text) = status_query.single_mut() {
+                        text.0 = format!("Join failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Optional resource to override the gatekeeper base URL (e.g. from env).
+#[derive(Resource)]
+pub struct GatekeeperUrl(pub String);
+
+// ---------------------------------------------------------------------------
+// Keyboard text input
+// ---------------------------------------------------------------------------
+
+fn handle_text_input(
+    mut keyboard_events: MessageReader<KeyboardInput>,
+    mut name_buf: ResMut<NameBuffer>,
+    mut name_query: Query<&mut Text, With<NameInput>>,
+) {
+    let mut changed = false;
+    for event in keyboard_events.read() {
+        if event.state != ButtonState::Pressed {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Character(c) => {
+                for ch in c.chars() {
+                    // Filter out non-printable characters.
+                    if !ch.is_control() {
+                        name_buf.0.push(ch);
+                        changed = true;
+                    }
+                }
+            }
+            Key::Backspace => {
+                name_buf.0.pop();
+                changed = true;
+            }
+            _ => {}
+        }
+    }
+    if changed {
+        if let Ok(mut text) = name_query.single_mut() {
+            text.0 = format!("{}_", name_buf.0);
+        }
+    }
+}
+
+crates/game/client/mods
+    pub mod input;
+pub mod interpolation;
+pub mod login;
+pub mod net;
+
+use bevy::prelude::*;
+use rustls;
+
+use input::ClientInputPlugin;
+use login::LoginPlugin;
+use net::ClientNetPlugin;
+use interpolation::InterpolationPlugin;
+
+/// The game session received after a successful `/join`.
+#[derive(Resource, Clone)]
+pub struct GameSession {
+    pub token: String,
+    pub server_addr: String,
+    pub quic_port: u16,
+}
+
+/// Top-level app states.
+#[derive(States, Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub enum GameState {
+    #[default]
+    Login,
+    Connecting,
+    InGame,
+}
+
+pub fn run() {
+    // Install the ring crypto provider as the process-level default for rustls.
+    // Required when multiple providers are available (ring + aws-lc-rs via reqwest).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let gatekeeper_url = std::env::var("GATEKEEPER_URL")
+        .unwrap_or_else(|_| "http://20.104.144.109:3000".to_string());
+
+    App::new()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Extraction MMO".to_string(),
+                resolution: bevy::window::WindowResolution::new(1280_u32, 720_u32),
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_plugins(avian2d::PhysicsPlugins::default())
+        .init_state::<GameState>()
+        .insert_resource(login::GatekeeperUrl(gatekeeper_url))
+        .add_plugins(LoginPlugin)
+        .add_plugins(ClientNetPlugin)
+        .add_plugins(ClientInputPlugin)
+        .add_plugins(InterpolationPlugin)
+        .run();
+}
+
+game/crates/client/net
+    use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+
+use bevy::prelude::*;
+use bevy::tasks::Task;
+use futures_lite::future;
+use quinn::{ClientConfig, Endpoint};
+use tokio::runtime::Runtime;
+
+use common::packets::{AuthAck, PositionBatch, ValidateToken};
+
+use super::{GameSession, GameState};
+
+pub struct ClientNetPlugin;
+
+impl Plugin for ClientNetPlugin {
+    fn build(&self, app: &mut App) {
+        // Create one persistent Tokio runtime for all quinn operations.
+        let rt = Runtime::new().expect("failed to create Tokio runtime for QUIC");
+        app
+            .insert_resource(QuicRuntime(Arc::new(rt)))
+            .add_message::<PositionBatchReceived>()
+            .add_systems(OnEnter(GameState::Connecting), start_connect)
+            .add_systems(
+                Update,
+                poll_connect_task.run_if(in_state(GameState::Connecting)),
+            )
+            .add_systems(
+                Update,
+                receive_packets.run_if(in_state(GameState::InGame)),
+            );
+    }
+}
+
+/// A single persistent Tokio runtime that owns all quinn async tasks.
+/// Keeping it alive means the quinn endpoint driver keeps running.
+#[derive(Resource, Clone)]
+struct QuicRuntime(Arc<Runtime>);
+
+// ---------------------------------------------------------------------------
+// Connection task
+// ---------------------------------------------------------------------------
+
+#[derive(Component)]
+struct ConnectTask(Task<Result<(quinn::Connection, u32), String>>);
+
+/// The entity_id the server assigned to this client.
+#[derive(Resource, Clone, Copy)]
+pub struct MyEntityId(pub u32);
+
+/// Bevy resource holding the active QUIC connection to the game server.
+#[derive(Resource)]
+#[allow(dead_code)]
+pub struct ServerConnection(pub quinn::Connection);
+
+/// Channel receiver fed by the background datagram receive task.
+/// Wrapped in Mutex so it satisfies Bevy's Resource: Sync bound.
+#[derive(Resource)]
+pub struct DatagramReceiver(std::sync::Mutex<Receiver<Vec<u8>>>);
+
+fn start_connect(
+    mut commands: Commands,
+    session: Res<GameSession>,
+    rt: Res<QuicRuntime>,
+) {
+    let addr = format!("{}:{}", session.server_addr, session.quic_port);
+    let token = session.token.clone();
+    let rt = rt.0.clone();
+
+    // Spawn a blocking task that drives quinn on the persistent runtime.
+    let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+        // Move the blocking connect into a std thread so we can call
+        // Runtime::block_on without nesting runtimes.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(quinn::Connection, u32), String>>(1);
+        let rt_clone = rt.clone();
+        std::thread::spawn(move || {
+            let result = rt_clone.block_on(async move {
+                let endpoint = make_client_endpoint().map_err(|e| e.to_string())?;
+
+                let resolved: Vec<std::net::SocketAddr> =
+                    std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+                        .map_err(|e| e.to_string())?
+                        .collect();
+                let server_addr = resolved
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or_else(|| resolved.first())
+                    .copied()
+                    .ok_or_else(|| format!("Could not resolve {addr}"))?;
+
+                let conn = endpoint
+                    .connect(server_addr, "localhost")
+                    .map_err(|e| e.to_string())?
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+                let payload = bitcode::encode(&ValidateToken { token });
+                send.write_all(&payload).await.map_err(|e| e.to_string())?;
+                send.finish().ok();
+
+                // Read the AuthAck to learn our entity_id.
+                let ack_data = recv.read_to_end(64).await.map_err(|e| e.to_string())?;
+                let ack = bitcode::decode::<AuthAck>(&ack_data).map_err(|e| e.to_string())?;
+
+                Ok::<_, String>((conn, ack.entity_id))
+            });
+            let _ = tx.send(result);
+        });
+        rx.recv().unwrap_or(Err("connect thread died".into()))
+    });
+
+    commands.spawn(ConnectTask(task));
+}
+
+fn poll_connect_task(
+    mut commands: Commands,
+    mut tasks: Query<(Entity, &mut ConnectTask)>,
+    mut next_state: ResMut<NextState<GameState>>,
+    rt: Res<QuicRuntime>,
+) {
+    for (entity, mut task) in &mut tasks {
+        if let Some(result) = future::block_on(future::poll_once(&mut task.0)) {
+            commands.entity(entity).despawn();
+            match result {
+                Ok((conn, entity_id)) => {
+                    let (tx, rx): (SyncSender<Vec<u8>>, Receiver<Vec<u8>>) =
+                        mpsc::sync_channel(256);
+                    let conn_clone = conn.clone();
+                    let rt_clone = rt.0.clone();
+                    // Spawn the datagram recv loop on the persistent runtime
+                    // so it shares the same runtime as the quinn endpoint driver.
+                    rt_clone.spawn(async move {
+                        loop {
+                            match conn_clone.read_datagram().await {
+                                Ok(data) => {
+                                    if tx.send(data.to_vec()).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Datagram receive error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    commands.insert_resource(ServerConnection(conn));
+                    commands.insert_resource(DatagramReceiver(std::sync::Mutex::new(rx)));
+                    commands.insert_resource(MyEntityId(entity_id));
+                    next_state.set(GameState::InGame);
+                    tracing::info!(entity_id, "Connected to game server — entering game");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to game server: {e}");
+                    next_state.set(GameState::Login);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Packet receive loop
+// ---------------------------------------------------------------------------
+
+/// Message emitted when a fresh `PositionBatch` arrives from the server.
+#[derive(Message)]
+pub struct PositionBatchReceived(pub PositionBatch);
+
+fn receive_packets(
+    receiver: Option<Res<DatagramReceiver>>,
+    mut batch_writer: MessageWriter<PositionBatchReceived>,
+) {
+    let Some(receiver) = receiver else { return };
+    let Ok(rx) = receiver.0.lock() else { return };
+    while let Ok(data) = rx.try_recv() {
+        if let Ok(batch) = bitcode::decode::<PositionBatch>(&data) {
+            batch_writer.write(PositionBatchReceived(batch));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS — skip cert verification in debug builds
+// ---------------------------------------------------------------------------
+
+fn make_client_endpoint() -> anyhow::Result<Endpoint> {
+    let crypto = make_client_crypto()?;
+    let mut transport = quinn::TransportConfig::default();
+    // Send a QUIC PING every 10 s to keep the connection alive.
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    // Allow up to 60 s of silence before declaring the connection dead.
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(60).try_into()?,
+    ));
+    let mut client_cfg = ClientConfig::new(Arc::new(crypto));
+    client_cfg.transport_config(Arc::new(transport));
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+fn make_client_crypto() -> anyhow::Result<quinn::crypto::rustls::QuicClientConfig> {
+    // The server generates a self-signed cert at runtime via rcgen.
+    // Until a proper PKI with a shared CA is in place, skip verification.
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    quinn::crypto::rustls::QuicClientConfig::try_from(crypto).map_err(Into::into)
+}
+
+// ---------------------------------------------------------------------------
+// Dev cert verifier
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer,
+        _intermediates: &[rustls::pki_types::CertificateDer],
+        _server_name: &rustls::pki_types::ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+crates/game/server/charcontroller
+    use avian2d::{math::*, prelude::*};
+use bevy::prelude::*;
+
+pub struct CharacterControllerPlugin;
+
+impl Plugin for CharacterControllerPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            Update,
+            (
+                update_grounded,
+                apply_movement_damping,
+            )
+                .chain(),
+        );
+    }
+}
+
+/// A marker component indicating that an entity is using a character controller.
+#[derive(Component)]
+pub struct CharacterController;
+
+/// A marker component indicating that an entity is on the ground.
+#[derive(Component)]
+#[component(storage = "SparseSet")]
+pub struct Grounded;
+
+/// The acceleration used for character movement.
+#[derive(Component)]
+pub struct MovementAcceleration(pub Scalar);
+
+/// The damping factor used for slowing down movement.
+#[derive(Component)]
+pub struct MovementDampingFactor(pub Scalar);
+
+/// The strength of a jump.
+#[derive(Component)]
+pub struct JumpImpulse(pub Scalar);
+
+/// The maximum angle a slope can have for a character controller
+/// to be able to climb and jump. If the slope is steeper than this angle,
+/// the character will slide down.
+#[derive(Component)]
+pub struct MaxSlopeAngle(pub Scalar);
+
+/// A bundle that contains the components needed for a basic
+/// kinematic character controller.
+#[derive(Bundle)]
+pub struct CharacterControllerBundle {
+    character_controller: CharacterController,
+    body: RigidBody,
+    collider: Collider,
+    ground_caster: ShapeCaster,
+    locked_axes: LockedAxes,
+    movement: MovementBundle,
+}
+
+/// A bundle that contains components for character movement.
+#[derive(Bundle)]
+pub struct MovementBundle {
+    acceleration: MovementAcceleration,
+    damping: MovementDampingFactor,
+    jump_impulse: JumpImpulse,
+    max_slope_angle: MaxSlopeAngle,
+}
+
+impl MovementBundle {
+    pub const fn new(
+        acceleration: Scalar,
+        damping: Scalar,
+        jump_impulse: Scalar,
+        max_slope_angle: Scalar,
+    ) -> Self {
+        Self {
+            acceleration: MovementAcceleration(acceleration),
+            damping: MovementDampingFactor(damping),
+            jump_impulse: JumpImpulse(jump_impulse),
+            max_slope_angle: MaxSlopeAngle(max_slope_angle),
+        }
+    }
+}
+
+impl Default for MovementBundle {
+    fn default() -> Self {
+        Self::new(30.0, 0.9, 7.0, PI * 0.45)
+    }
+}
+
+impl CharacterControllerBundle {
+    pub fn new(collider: Collider) -> Self {
+        // Create shape caster as a slightly smaller version of collider
+        let mut caster_shape = collider.clone();
+        caster_shape.set_scale(Vector::ONE * 0.99, 10);
+
+        Self {
+            character_controller: CharacterController,
+            body: RigidBody::Dynamic,
+            collider,
+            ground_caster: ShapeCaster::new(caster_shape, Vector::ZERO, 0.0, Dir2::NEG_Y)
+                .with_max_distance(10.0),
+            locked_axes: LockedAxes::ROTATION_LOCKED,
+            movement: MovementBundle::default(),
+        }
+    }
+
+    pub fn with_movement(
+        mut self,
+        acceleration: Scalar,
+        damping: Scalar,
+        jump_impulse: Scalar,
+        max_slope_angle: Scalar,
+    ) -> Self {
+        self.movement = MovementBundle::new(acceleration, damping, jump_impulse, max_slope_angle);
+        self
+    }
+}
+
+/// Updates the [`Grounded`] status for character controllers.
+fn update_grounded(
+    mut commands: Commands,
+    mut query: Query<
+        (Entity, &ShapeHits, &Rotation, Option<&MaxSlopeAngle>),
+        With<CharacterController>,
+    >,
+) {
+    for (entity, hits, rotation, max_slope_angle) in &mut query {
+        // The character is grounded if the shape caster has a hit with a normal
+        // that isn't too steep.
+        let is_grounded = hits.iter().any(|hit| {
+            if let Some(angle) = max_slope_angle {
+                (rotation * -hit.normal2).angle_to(Vector::Y).abs() <= angle.0
+            } else {
+                true
+            }
+        });
+
+        if is_grounded {
+            commands.entity(entity).insert(Grounded);
+        } else {
+            commands.entity(entity).remove::<Grounded>();
+        }
+    }
+}
+
+/// Slows down movement in the X direction.
+fn apply_movement_damping(
+    time: Res<Time>,
+    mut query: Query<(&MovementDampingFactor, &mut LinearVelocity)>,
+) {
+    // Precision is adjusted so that the example works with
+    // both the `f32` and `f64` features. Otherwise you don't need this.
+    let delta_time = time.delta_secs_f64().adjust_precision();
+
+    for (damping_factor, mut linear_velocity) in &mut query {
+        // We could use `LinearDamping`, but we don't want to dampen movement along the Y axis
+        linear_velocity.x *= 1.0 / (1.0 + damping_factor.0 * delta_time);
+    }
+}
+
+
+    use bevy::prelude::*;
+
+use common::constants::INTEREST_RADIUS_TILES;
+use common::packets::PositionSnapshot;
+
+/// Tile size in world units — determines the interest bubble radius.
+const TILE_SIZE: f32 = 32.0;
+const INTEREST_RADIUS: f32 = INTEREST_RADIUS_TILES as f32 * TILE_SIZE;
+
+/// Return all snapshots visible from `observer_pos`.
+/// Only entities within `INTEREST_RADIUS` world units are included.
+pub fn interest_query(
+    observer_pos: Vec2,
+    all: &[(u32, Vec2)], // (entity_id, position)
+) -> Vec<PositionSnapshot> {
+    let radius_sq = INTEREST_RADIUS * INTEREST_RADIUS;
+    all.iter()
+        .filter(|(_, pos)| (*pos - observer_pos).length_squared() <= radius_sq)
+        .map(|(entity_id, pos)| PositionSnapshot {
+            entity_id: *entity_id,
+            x: pos.x,
+            y: pos.y,
+            vx: 0.0,
+            vy: 0.0,
+        })
+        .collect()
+}
+
+
+crates/game/server/mods
+    pub mod interest;
+pub mod net;
+pub mod simulation;
+pub mod char_controller;
+
+use std::sync::Arc;
+
+use bevy::prelude::*;
+use bevy::app::ScheduleRunnerPlugin;
+use bevy::transform::TransformPlugin;
+use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
+
+use common::constants::TICK_RATE_HZ;
+
+use crate::server::net::{ConnectedPlayers, SimCommandReceiver, QuicServer};
+use crate::server::simulation::SimulationPlugin;
+
+/// Env-driven configuration read at startup.
+pub struct ServerConfig {
+    pub server_id: String,
+    /// Externally-reachable hostname/IP registered in Redis for clients to connect to.
+    pub public_addr: String,
+    pub quic_port: u16,
+    pub max_players: u32,
+    pub redis_url: String,
+    pub gatekeeper_addr: String,
+}
+
+impl ServerConfig {
+    pub fn from_env() -> Self {
+        let server_id = std::env::var("SERVER_ID")
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        // PUBLIC_ADDR is the address clients will connect to.
+        // Defaults to "localhost" for local dev; Docker sets it to the
+        // container's externally-reachable hostname or IP.
+        let public_addr = std::env::var("PUBLIC_ADDR")
+            .unwrap_or_else(|_| "localhost".to_string());
+        Self {
+            server_id,
+            public_addr,
+            quic_port: std::env::var("QUIC_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(7000),
+            max_players: std::env::var("MAX_PLAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(common::constants::DEFAULT_CAPACITY),
+            redis_url: std::env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://redis:6379".to_string()),
+            gatekeeper_addr: std::env::var("GATEKEEPER_ADDR")
+                .unwrap_or_else(|_| "gatekeeper:3001".to_string()),
+        }
+    }
+}
+
+/// Bevy resource wrapping the shared QUIC server handle.
+#[derive(Resource)]
+pub struct QuicServerHandle(pub Arc<Mutex<QuicServer>>);
+
+/// Bevy resource wrapping the Tokio runtime used for async ops on the server.
+#[derive(Resource)]
+pub struct TokioRuntime(pub Arc<Runtime>);
+
+pub fn run() {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let cfg = ServerConfig::from_env();
+    let rt = Arc::new(Runtime::new().expect("failed to create Tokio runtime"));
+
+    // Shared state between async QUIC tasks and Bevy systems.
+    let conn_list = ConnectedPlayers::default();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<net::SimCommand>(1024);
+
+    // Bootstrap: register in Redis as "starting", bind QUIC, then set "ready".
+    let quic_server = rt.block_on(async {
+        net::setup(&cfg, conn_list.clone(), cmd_tx).await.expect("QUIC setup failed")
+    });
+    let quic_handle = Arc::new(Mutex::new(quic_server));
+
+    let tick_duration = std::time::Duration::from_secs_f64(1.0 / TICK_RATE_HZ as f64);
+
+    App::new()
+        .add_plugins(
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(tick_duration)),
+        )
+        .add_plugins(TransformPlugin)
+        .add_plugins(SimulationPlugin)
+        .insert_resource(QuicServerHandle(quic_handle))
+        .insert_resource(TokioRuntime(rt))
+        .insert_resource(conn_list)
+        .insert_resource(SimCommandReceiver(std::sync::Mutex::new(cmd_rx)))
+        .run();
+}
+
+crates/game/server/net
+    use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context;
+use bevy::prelude::Resource;
+use bytes::Bytes;
+use deadpool_redis::{Config as RedisConfig, Pool, Runtime as RedisRuntime};
+use deadpool_redis::redis::AsyncCommands;
+use quinn::{Connection, Endpoint, ServerConfig};
+use rcgen::generate_simple_self_signed;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+use common::packets::{AuthAck, PlayerInput, ValidateToken};
+use common::redis_keys;
+
+use super::ServerConfig as GameServerConfig;
+
+// ---------------------------------------------------------------------------
+// Shared state between async QUIC tasks and Bevy simulation
+// ---------------------------------------------------------------------------
+
+static NEXT_ENTITY_ID: AtomicU32 = AtomicU32::new(1);
+
+/// A command sent from an async connection handler to the Bevy simulation.
+pub enum SimCommand {
+    PlayerJoined { entity_id: u32, display_name: String },
+    PlayerLeft  { entity_id: u32 },
+    PlayerInput { entity_id: u32, dx: f32, dy: f32 },
+}
+
+/// Thread-safe list of authenticated QUIC connections, used by Bevy systems
+/// to broadcast position snapshots without needing an async context
+/// (`quinn::Connection::send_datagram` is synchronous).
+#[derive(Clone, Default, Resource)]
+pub struct ConnectedPlayers(pub Arc<Mutex<Vec<(u32, Connection)>>>);
+
+/// Bevy resource — wraps the receiver end of the simulation command channel.
+#[derive(Resource)]
+pub struct SimCommandReceiver(pub Mutex<std::sync::mpsc::Receiver<SimCommand>>);
+
+// ---------------------------------------------------------------------------
+// QuicServer — owns the endpoint and tracks connected peers
+// ---------------------------------------------------------------------------
+
+pub struct QuicServer {
+    pub endpoint: Endpoint,
+}
+
+pub async fn setup(
+    cfg: &GameServerConfig,
+    conn_list: ConnectedPlayers,
+    cmd_tx: std::sync::mpsc::SyncSender<SimCommand>,
+) -> anyhow::Result<QuicServer> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // may already be installed
+
+    let redis_pool = create_redis_pool(&cfg.redis_url)?;
+
+    // Register as "starting".
+    register_server(cfg, &redis_pool, "starting").await?;
+
+    let endpoint = bind_quic_endpoint(cfg.quic_port).await?;
+
+    // Accept player connections in a background task.
+    let _endpoint_clone = endpoint.clone();
+    tokio::spawn(accept_loop(
+        _endpoint_clone,
+        cfg.server_id.clone(),
+        conn_list,
+        cmd_tx,
+        redis_pool.clone(),
+    ));
+
+    // Set status to "ready".
+    register_server(cfg, &redis_pool, "ready").await?;
+    tracing::info!(
+        server_id = %cfg.server_id,
+        port = cfg.quic_port,
+        "Game server READY"
+    );
+
+    // Start Redis heartbeat (every 2 s).
+    let pool_clone = redis_pool.clone();
+    let server_id = cfg.server_id.clone();
+    tokio::spawn(redis_heartbeat(pool_clone, server_id));
+
+    Ok(QuicServer { endpoint })
+}
+
+// ---------------------------------------------------------------------------
+// Redis helpers
+// ---------------------------------------------------------------------------
+
+fn create_redis_pool(url: &str) -> anyhow::Result<Pool> {
+    RedisConfig::from_url(url)
+        .create_pool(Some(RedisRuntime::Tokio1))
+        .context("deadpool-redis create_pool")
+}
+
+async fn register_server(
+    cfg: &GameServerConfig,
+    pool: &Pool,
+    status: &str,
+) -> anyhow::Result<()> {
+    let mut conn = pool.get().await.context("Redis pool error")?;
+    let key = redis_keys::server_key(&cfg.server_id);
+
+    let (): () = deadpool_redis::redis::cmd("HSET")
+        .arg(&key)
+        .arg("address")
+        .arg(&cfg.public_addr)
+        .arg("quic_port")
+        .arg(cfg.quic_port)
+        .arg("player_count")
+        .arg(0u32)
+        .arg("capacity")
+        .arg(cfg.max_players)
+        .arg("status")
+        .arg(status)
+        .query_async(&mut *conn)
+        .await
+        .context("HSET server")?;
+
+    if status == "ready" {
+        let (): () = conn
+            .sadd(redis_keys::active_servers_key(), &cfg.server_id)
+            .await
+            .context("SADD servers:active")?;
+    }
+
+    Ok(())
+}
+
+async fn redis_heartbeat(pool: Pool, server_id: String) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    loop {
+        interval.tick().await;
+        match pool.get().await {
+            Ok(mut conn) => {
+                // player_count is already tracked via INCR/DECR; just touch the key.
+                let key = redis_keys::server_key(&server_id);
+                let _: Result<(), _> = deadpool_redis::redis::cmd("HSET")
+                    .arg(&key)
+                    .arg("heartbeat")
+                    .arg(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    )
+                    .query_async(&mut *conn)
+                    .await;
+            }
+            Err(e) => tracing::warn!("Redis heartbeat pool error: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QUIC endpoint
+// ---------------------------------------------------------------------------
+
+async fn bind_quic_endpoint(quic_port: u16) -> anyhow::Result<Endpoint> {
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()])
+        .context("rcgen cert")?;
+
+    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        cert.key_pair.serialize_der(),
+    ));
+
+    let tls = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .context("rustls ServerConfig")?;
+
+    let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .context("QuicServerConfig")?;
+
+    let endpoint = Endpoint::server(
+        ServerConfig::with_crypto(Arc::new(quic_cfg)),
+        format!("0.0.0.0:{quic_port}").parse()?,
+    )
+    .context("Endpoint::server")?;
+
+    Ok(endpoint)
+}
+
+async fn accept_loop(
+    endpoint: Endpoint,
+    server_id: String,
+    conn_list: ConnectedPlayers,
+    cmd_tx: std::sync::mpsc::SyncSender<SimCommand>,
+    redis_pool: Pool,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let conn_list = conn_list.clone();
+        let cmd_tx = cmd_tx.clone();
+        let redis_pool = redis_pool.clone();
+        let server_id = server_id.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => {
+                    tracing::info!(remote = %conn.remote_address(), "Player QUIC connection");
+                    handle_connection(conn, conn_list, cmd_tx, redis_pool, server_id).await;
+                }
+                Err(e) => tracing::warn!("QUIC accept error: {e}"),
+            }
+        });
+    }
+}
+
+async fn handle_connection(
+    conn: Connection,
+    conn_list: ConnectedPlayers,
+    cmd_tx: std::sync::mpsc::SyncSender<SimCommand>,
+    redis_pool: Pool,
+    server_id: String,
+) {
+    let entity_id = NEXT_ENTITY_ID.fetch_add(1, Ordering::Relaxed);
+
+    // ── Auth handshake ──────────────────────────────────────────────────────
+    let display_name = match conn.accept_bi().await {
+        Ok((mut send, mut recv)) => {
+            let data = match recv.read_to_end(4096).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Failed to read auth stream: {e}");
+                    return;
+                }
+            };
+            let name = if let Ok(msg) = bitcode::decode::<ValidateToken>(&data) {
+                tracing::info!(token = %msg.token, entity_id, remote = %conn.remote_address(), "Player authenticated");
+                msg.token
+            } else {
+                format!("player_{entity_id}")
+            };
+            // Reply with the assigned entity_id so the client knows who it is.
+            let ack = bitcode::encode(&AuthAck { entity_id });
+            if let Err(e) = send.write_all(&Bytes::from(ack)).await {
+                tracing::warn!("Failed to send AuthAck: {e}");
+                return;
+            }
+            send.finish().ok();
+            name
+        }
+        Err(e) => {
+            tracing::warn!("Failed to accept auth stream: {e}");
+            return;
+        }
+    };
+
+    // Register in the shared connection list so Bevy can broadcast to this player.
+    conn_list.0.lock().unwrap().push((entity_id, conn.clone()));
+
+    // Notify the Bevy simulation that a player joined.
+    let _ = cmd_tx.send(SimCommand::PlayerJoined {
+        entity_id,
+        display_name,
+    });
+
+    // ── Input receive loop ──────────────────────────────────────────────────
+    loop {
+        match conn.read_datagram().await {
+            Ok(data) => {
+                if let Ok(input) = bitcode::decode::<PlayerInput>(&data) {
+                    let _ = cmd_tx.send(SimCommand::PlayerInput {
+                        entity_id,
+                        dx: input.dx,
+                        dy: input.dy,
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::info!(entity_id, remote = %conn.remote_address(), "Player disconnected: {e}");
+                break;
+            }
+        }
+    }
+
+    // ── Cleanup ─────────────────────────────────────────────────────────────
+    conn_list.0.lock().unwrap().retain(|(id, _)| *id != entity_id);
+    let _ = cmd_tx.send(SimCommand::PlayerLeft { entity_id });
+    // Decrement the player_count in Redis so the orchestrator and gatekeeper
+    // see accurate occupancy and can route new joins correctly.
+    match redis_pool.get().await {
+        Ok(mut conn) => {
+            let key = redis_keys::server_key(&server_id);
+            let _: Result<(), _> = deadpool_redis::redis::cmd("HINCRBY")
+                .arg(&key)
+                .arg("player_count")
+                .arg(-1_i64)
+                .query_async(&mut *conn)
+                .await;
+        }
+        Err(e) => tracing::warn!("Redis pool error on disconnect: {e}"),
+    }}
+
+
+crates/game/server/simulations
+    use avian2d::{math::*, prelude::*};
+
+use std::collections::HashMap;
+
+use bevy::prelude::*;
+use bytes::Bytes;
+
+use common::packets::{PositionBatch, PositionSnapshot};
+
+use super::net::{ConnectedPlayers, SimCommand, SimCommandReceiver};
+use super::char_controller::*;
+
+pub struct SimulationPlugin;
+
+const PLAYER_JUMP_IMPULSE: f32 = 120.0;
+const PLAYER_GRAVITY_SCALE: f32 = 4.0;
+const PLAYER_MOVEMENT_ACCELERATION: f32 = 1250.0;
+const PLAYER_MOVEMENT_DAMPING: f32 = 5.0;
+const PLAYER_SLOPE_ANGLE_DEGREES: f32 = 30.0;
+const PLAYER_COLLIDER_DENSITY: f32 = 2.0;
+
+const FLOOR_RESTITUTION: f32 = 0.7;
+const ARENA_WIDTH: f32 = 10000.0;
+const ARENA_HEIGHT: f32 = 1000.0;
+const ARENA_WALL_THICKNESS: f32 = 10.0;
+
+impl Plugin for SimulationPlugin {
+    fn build(&self, app: &mut App) {
+        app
+            .add_plugins((
+            PhysicsPlugins::default().with_length_unit(20.0),
+            CharacterControllerPlugin,
+            ))
+            .init_resource::<TickCounter>()
+            .init_resource::<PlayerInputBuffer>()
+            .add_message::<SpawnPlayer>()
+            .add_message::<DespawnPlayer>()
+            .add_systems(Startup, spawn_floor)
+            .add_systems(FixedUpdate, process_net_commands)
+            .add_systems(FixedUpdate, spawn_players.after(process_net_commands))
+            .add_systems(FixedUpdate, despawn_players.after(spawn_players))
+            .add_systems(FixedUpdate, apply_player_inputs.after(despawn_players))
+            .add_systems(FixedUpdate, broadcast_position_snapshots.after(apply_player_inputs));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tick counter
+// ---------------------------------------------------------------------------
+
+#[derive(Resource, Default)]
+pub struct TickCounter(pub u32);
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+/// Latest directional input received from each player this tick.
+#[derive(Resource, Default)]
+pub struct PlayerInputBuffer(pub HashMap<u32, Vec2>);
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+/// Identifies a player entity on the server.
+#[derive(Component)]
+pub struct Player {
+    pub entity_id: u32,
+    pub display_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+#[derive(Message)]
+pub struct SpawnPlayer {
+    pub entity_id: u32,
+    pub display_name: String,
+    /// World-space spawn position.
+    pub position: Vec2,
+}
+
+#[derive(Message)]
+pub struct DespawnPlayer {
+    pub entity_id: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Systems
+// ---------------------------------------------------------------------------
+
+/// Spawn the static floor so players don't fall into the void.
+fn spawn_floor(mut commands: Commands) {
+    commands.spawn((
+        Transform::from_translation(Vec3::new(0.0, -300.0, 0.0)),
+        GlobalTransform::default(),
+        RigidBody::Static,
+        Collider::rectangle(ARENA_WIDTH, ARENA_WALL_THICKNESS),
+        Restitution::new(FLOOR_RESTITUTION).with_combine_rule(CoefficientCombine::Max),
+    ));
+}
+
+fn spawn_players(
+    mut commands: Commands,
+    mut events: MessageReader<SpawnPlayer>,
+) {
+    for ev in events.read() {
+        commands.spawn((
+            Player {
+                entity_id: ev.entity_id,
+                display_name: ev.display_name.clone(),
+            },
+            Transform::from_translation(ev.position.extend(0.0)),
+            GlobalTransform::default(),
+            CollisionEventsEnabled,
+            CharacterControllerBundle::new(Collider::circle(16.0)).with_movement(PLAYER_MOVEMENT_ACCELERATION, PLAYER_MOVEMENT_DAMPING, PLAYER_JUMP_IMPULSE, (PLAYER_SLOPE_ANGLE_DEGREES as Scalar).to_radians()),
+            Friction::ZERO.with_combine_rule(CoefficientCombine::Min),
+            Restitution::ZERO.with_combine_rule(CoefficientCombine::Min),
+            ColliderDensity(PLAYER_COLLIDER_DENSITY),
+            GravityScale(PLAYER_GRAVITY_SCALE),
+        ));
+        tracing::info!(
+            entity_id = ev.entity_id,
+            name = %ev.display_name,
+            "Spawned player"
+        );
+    }
+}
+
+fn despawn_players(
+    mut commands: Commands,
+    mut events: MessageReader<DespawnPlayer>,
+    query: Query<(Entity, &Player)>,
+) {
+    for ev in events.read() {
+        for (entity, player) in &query {
+            if player.entity_id == ev.entity_id {
+                commands.entity(entity).despawn();
+                tracing::info!(entity_id = ev.entity_id, "Despawned player");
+                break;
+            }
+        }
+    }
+}
+
+/// Every tick: collect positions of all players and broadcast to connected clients.
+fn broadcast_position_snapshots(
+    mut tick: ResMut<TickCounter>,
+    query: Query<(&Player, &Transform)>,
+    conn_list: Res<ConnectedPlayers>,
+) {
+    tick.0 = tick.0.wrapping_add(1);
+
+    let snapshots: Vec<PositionSnapshot> = query
+        .iter()
+        .map(|(player, transform)| PositionSnapshot {
+            entity_id: player.entity_id,
+            x: transform.translation.x,
+            y: transform.translation.y,
+            vx: 0.0,
+            vy: 0.0,
+        })
+        .collect();
+
+    if snapshots.is_empty() {
+        return;
+    }
+
+    let batch = PositionBatch { tick: tick.0, snapshots };
+    let data = Bytes::from(bitcode::encode(&batch));
+
+    let conns = conn_list.0.lock().unwrap();
+    for (_, conn) in conns.iter() {
+        if let Err(e) = conn.send_datagram(data.clone()) {
+            tracing::warn!("send_datagram error: {e}");
+        }
+    }
+}
+
+/// Poll the net→sim command channel and translate commands into Bevy messages.
+fn process_net_commands(
+    cmd_rx: Res<SimCommandReceiver>,
+    mut spawn_writer: MessageWriter<SpawnPlayer>,
+    mut despawn_writer: MessageWriter<DespawnPlayer>,
+    mut input_buf: ResMut<PlayerInputBuffer>,
+) {
+    // Clear every tick so players with no input this tick stop moving.
+    input_buf.0.clear();
+
+    let rx = cmd_rx.0.lock().unwrap();
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            SimCommand::PlayerJoined { entity_id, display_name } => {
+                spawn_writer.write(SpawnPlayer {
+                    entity_id,
+                    display_name,
+                    position: Vec2::ZERO,
+                });
+            }
+            SimCommand::PlayerLeft { entity_id } => {
+                despawn_writer.write(DespawnPlayer { entity_id });
+                input_buf.0.remove(&entity_id);
+            }
+            SimCommand::PlayerInput { entity_id, dx, dy } => {
+                input_buf.0.insert(entity_id, Vec2::new(dx, dy));
+            }
+        }
+    }
+}
+
+/// Apply buffered player inputs via the character-controller physics.
+fn apply_player_inputs(
+    time: Res<Time>,
+    mut query: Query<(&Player, &MovementAcceleration, &JumpImpulse, &mut LinearVelocity, Has<Grounded>)>,
+    input_buf: Res<PlayerInputBuffer>,
+) {
+    let delta_time = time.delta_secs_f64().adjust_precision();
+
+    for (player, movement_acceleration, jump_impulse, mut linear_velocity, is_grounded) in &mut query {
+        if let Some(&dir) = input_buf.0.get(&player.entity_id) {
+            if dir.x != 0.0 {
+                linear_velocity.x += dir.x as Scalar * movement_acceleration.0 * delta_time;
+            }
+            if dir.y > 0.5 && is_grounded {
+                linear_velocity.y = jump_impulse.0;
+            }
+        }
+    }
+}
+
+crate/game/main
+    // Compile-time guard: exactly one of `server` or `client` must be enabled.
+#[cfg(all(feature = "server", feature = "client"))]
+compile_error!("features `server` and `client` are mutually exclusive");
+
+#[cfg(not(any(feature = "server", feature = "client")))]
+compile_error!("one of features `server` or `client` must be enabled");
+
+#[cfg(feature = "server")]
+mod server;
+
+#[cfg(feature = "client")]
+mod client;
+
+fn main() {
+    #[cfg(feature = "server")]
+    server::run();
+
+    #[cfg(feature = "client")]
+    client::run();
+}
+
+
+crate/game/cargo.toml
+    [package]
+name = "game"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "game"
+path = "src/main.rs"
+
+[features]
+default = ["client"]
+dev-dynamic = ["bevy/dynamic_linking"]
+client = ["dep:reqwest", "dep:quinn", "dep:rustls", "dep:tokio"]
+server = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:deadpool-redis", "dep:tokio", "dep:tracing-subscriber", "dep:uuid"]
+
+[dependencies]
+common         = { workspace = true }
+bevy           = { workspace = true }
+avian2d        = { workspace = true }
+serde          = { workspace = true }
+bitcode        = { workspace = true }
+tracing        = { workspace = true }
+anyhow         = { workspace = true }
+futures-lite   = "2"
+bytes          = { workspace = true }
+
+# client-only
+reqwest        = { workspace = true, optional = true }
+
+# server-only
+quinn          = { workspace = true, optional = true }
+rustls         = { workspace = true, optional = true }
+rcgen          = { workspace = true, optional = true }
+deadpool-redis = { workspace = true, optional = true }
+tokio          = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+uuid           = { workspace = true, optional = true }
+
+[orchestrator/Cargo.toml]
+    [package]
+    name = "orchestrator"
+    version = "0.1.0"
+    edition = "2024"
+
+    [[bin]]
+    name = "orchestrator"
+    path = "src/main.rs"
+
+    [dependencies]
+    common       = { workspace = true }
+    tokio        = { workspace = true }
+    kube         = { workspace = true }
+    k8s-openapi  = { workspace = true }
+    deadpool-redis = { workspace = true }
+    quinn        = { workspace = true }
+    rustls       = { workspace = true }
+    rcgen        = { workspace = true }
+    uuid         = { workspace = true }
+    tracing      = { workspace = true }
+    tracing-subscriber = { workspace = true }
+    anyhow       = { workspace = true }
+    serde        = { workspace = true }
+
+[orchestrator/src/docker_ops.rs]
+use std::collections::HashMap;
+use std::time::Duration;
+
+use anyhow::Context;
+use bollard::Docker;
+use bollard::container::{Config, CreateContainerOptions, NetworkingConfig, StartContainerOptions};
+use bollard::models::{EndpointSettings, HostConfig, PortBinding};
+use uuid::Uuid;
+
+use crate::redis_ops;
+
+/// QUIC port pool for dynamically spawned game servers.
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn game_image() -> String {
+    std::env::var("GAME_IMAGE").unwrap_or_else(|_| "game-server_infonuagique:latest".to_string())
+}
+
+fn game_network() -> String {
+    std::env::var("GAME_NETWORK").unwrap_or_else(|_| "game-net".to_string())
+}
+
+fn port_range() -> (u16, u16) {
+    let start = std::env::var("QUIC_PORT_RANGE_START")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7000);
+    let end = std::env::var("QUIC_PORT_RANGE_END")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7100);
+    (start, end)
+}
+
+/// Connect to the Docker daemon via the platform socket.
+pub fn connect() -> anyhow::Result<Docker> {
+    Docker::connect_with_socket_defaults().context("connect to Docker socket")
+}
+
+/// Stop and remove a container by its Docker container ID.
+pub async fn stop_container(docker: &Docker, container_id: &str) -> anyhow::Result<()> {
+    docker
+        .stop_container(container_id, None)
+        .await
+        .context("stop container")?;
+    docker
+        .remove_container(container_id, None)
+        .await
+        .context("remove container")?;
+    Ok(())
+}
+
+/// Spawn a new game-server container.
+///
+/// - Picks the next available QUIC port from the configured range.
+/// - Creates and starts the container.
+/// - Registers a pre-launch Redis entry so the game server can update it.
+/// - Polls Redis for `status=ready` with a 30s timeout; removes the container
+///   and Redis entry on failure.
+pub async fn spawn_server(
+    docker: &Docker,
+    pool: &deadpool_redis::Pool,
+    is_standby: bool,
+) -> anyhow::Result<String> {
+    let server_id = Uuid::new_v4().to_string();
+    let quic_port = pick_free_port(pool).await?;
+
+    // PUBLIC_ADDR is the address clients use to reach this server.
+    // Defaults to "localhost" so that port-mapped containers are reachable
+    // from the Windows host during local dev. Set the orchestrator env var
+    // PUBLIC_ADDR to override (e.g. a public IP for production).
+    let public_addr = std::env::var("PUBLIC_ADDR").unwrap_or_else(|_| "localhost".to_string());
+    let address = public_addr.clone();
+    // Docker-internal DNS name — used by the orchestrator's health checks.
+    let internal_addr = format!("game-{server_id}");
+
+    // Write a placeholder entry so wait_for_ready can poll it.
+    redis_ops::register_server(
+        pool,
+        &server_id,
+        "", // container_id filled in below
+        &address,
+        &internal_addr,
+        quic_port,
+        common::constants::DEFAULT_CAPACITY,
+    )
+    .await?;
+
+    let env = vec![
+        format!("SERVER_ID={server_id}"),
+        format!("QUIC_PORT={quic_port}"),
+        format!("PUBLIC_ADDR={public_addr}"),
+        format!("MAX_PLAYERS={}", common::constants::DEFAULT_CAPACITY),
+        std::env::var("REDIS_URL")
+            .map(|u| format!("REDIS_URL={u}"))
+            .unwrap_or_else(|_| "REDIS_URL=redis://redis:6379".to_string()),
+        std::env::var("GATEKEEPER_ADDR")
+            .map(|a| format!("GATEKEEPER_ADDR={a}"))
+            .unwrap_or_else(|_| "GATEKEEPER_ADDR=gatekeeper:3001".to_string()),
+    ];
+
+    // Bind the QUIC UDP port to the host so local clients can reach the container.
+    let port_key = format!("{quic_port}/udp");
+    let host_config = HostConfig {
+        port_bindings: Some(HashMap::from([
+            (port_key, Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(quic_port.to_string()),
+            }])),
+        ])),
+        ..Default::default()
+    };
+
+    let network_name = game_network();
+    let networking_config = NetworkingConfig {
+        endpoints_config: HashMap::from([
+            (network_name.clone(), EndpointSettings {
+                aliases: Some(vec![format!("game-{server_id}")]),
+                ..Default::default()
+            }),
+        ]),
+    };
+
+    let options = CreateContainerOptions {
+        name: format!("game-{server_id}"),
+        platform: None,
+    };
+
+    let config: Config<String> = Config {
+        image: Some(game_image()),
+        env: Some(env),
+        host_config: Some(host_config),
+        hostname: Some(format!("game-{server_id}")),
+        networking_config: Some(networking_config),
+        labels: Some(HashMap::from([
+            ("extraction-mmo.role".to_string(), "game-server".to_string()),
+            ("extraction-mmo.server-id".to_string(), server_id.clone()),
+            ("com.docker.compose.project".to_string(), "extraction-mmo".to_string()),
+            ("com.docker.compose.service".to_string(), "game-server".to_string()),
+        ])),
+        ..Default::default()
+    };
+
+    let create_resp = docker
+        .create_container(Some(options), config)
+        .await
+        .context("create container")?;
+
+    let container_id = create_resp.id.clone();
+
+    // Patch the container_id into Redis.
+    {
+        use deadpool_redis::redis::AsyncCommands;
+        let mut conn = pool.get().await.context("Redis pool")?;
+        let (): () = conn
+            .hset(
+                common::redis_keys::server_key(&server_id),
+                "container_id",
+                &container_id,
+            )
+            .await
+            .context("HSET container_id")?;
+    }
+
+    docker
+        .start_container(&container_id, None::<StartContainerOptions<String>>)
+        .await
+        .context("start container")?;
+
+    tracing::info!(
+        server_id = %server_id,
+        container_id = %container_id,
+        quic_port,
+        is_standby,
+        "Game server container started — waiting for ready"
+    );
+
+    // Wait for game server to self-report ready in Redis.
+    if let Err(e) = redis_ops::wait_for_ready(pool, &server_id, SPAWN_TIMEOUT).await {
+        tracing::error!(server_id = %server_id, "Server failed to become ready: {e}");
+        let _ = stop_container(docker, &container_id).await;
+        redis_ops::remove_server(pool, &server_id).await?;
+        return Err(e);
+    }
+
+    if is_standby {
+        redis_ops::set_standby(pool, &server_id).await?;
+        tracing::info!(server_id = %server_id, "Server registered as standby");
+    }
+
+    Ok(server_id)
+}
+
+/// Find the lowest QUIC port in the configured range not currently used by any registered server.
+async fn pick_free_port(pool: &deadpool_redis::Pool) -> anyhow::Result<u16> {
+    let (range_start, range_end) = port_range();
+    let servers = redis_ops::list_active_servers(pool).await?;
+    let used: std::collections::HashSet<u16> = servers.iter().map(|s| s.quic_port).collect();
+
+    (range_start..=range_end)
+        .find(|p| !used.contains(p))
+        .ok_or_else(|| anyhow::anyhow!("No free QUIC port in range {range_start}–{range_end}"))
+}
+
+[orchestrator/src/health.rs]
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::redis_ops;
+
+/// How many consecutive missed pings before a server is marked draining.
+const MAX_MISSED_PINGS: u8 = 2;
+
+/// Per-server missed-ping counter, keyed by server_id.
+static MISSED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Ping every active server's QUIC endpoint; mark non-responsive ones draining
+/// after `MAX_MISSED_PINGS` consecutive failures.
+pub async fn run_health_checks(pool: &deadpool_redis::Pool) -> anyhow::Result<()> {
+    let servers = redis_ops::list_active_servers(pool).await?;
+
+    let mut tasks = Vec::new();
+
+    for server in servers {
+        if server.status == "draining" || server.status == "starting" {
+            continue;
+        }
+
+            let pool = pool.clone();
+        tasks.push(tokio::spawn(async move {
+            // Use the ClusterIP stored in Redis as internal_addr for health checks.
+            let addr = format!("{}:{}", server.internal_addr, server.quic_port);
+            let alive = ping_quic(&addr).await;
+
+            // Scope the mutex lock so it is dropped before any await.
+            let should_drain = {
+                let mut missed = MISSED.lock().unwrap();
+                if alive {
+                    missed.remove(&server.id);
+                    false
+                } else {
+                    let count = missed.entry(server.id.clone()).or_insert(0);
+                    *count += 1;
+                    tracing::warn!(
+                        id = %server.id,
+                        missed = *count,
+                        "QUIC health check failed"
+                    );
+                    *count >= MAX_MISSED_PINGS
+                }
+            };
+
+            if should_drain {
+                tracing::error!(id = %server.id, "Server unresponsive — marking draining");
+                let _ = redis_ops::set_status(&pool, &server.id, "draining").await;
+            }
+        }));
+    }
+
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    Ok(())
+}
+
+/// Open a QUIC connection to `addr` and immediately close it.
+/// Returns `true` if the handshake succeeds.
+async fn ping_quic(addr: &str) -> bool {
+    // Resolve the hostname (Docker DNS) to a SocketAddr.
+    let server_addr = match tokio::net::lookup_host(addr).await {
+        Ok(mut addrs) => {
+            // Prefer IPv4 to match the client endpoint bound to 0.0.0.0.
+            let collected: Vec<_> = addrs.collect();
+            match collected.iter().find(|a| a.is_ipv4()).or_else(|| collected.first()) {
+                Some(a) => *a,
+                None => return false,
+            }
+        }
+        Err(_) => return false,
+    };
+
+    let Ok(endpoint) = make_ping_endpoint() else {
+        return false;
+    };
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let conn = endpoint
+            .connect(server_addr, "localhost")?
+            .await?;
+        conn.close(0u32.into(), b"ping");
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    matches!(result, Ok(Ok(())))
+}
+
+fn make_ping_endpoint() -> anyhow::Result<quinn::Endpoint> {
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?;
+    let client_cfg = quinn::ClientConfig::new(Arc::new(quic_cfg));
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_cfg);
+    Ok(endpoint)
+}
+
+// ---------------------------------------------------------------------------
+// Dev cert verifier — identical to game client's NoVerifier
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct NoVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer,
+        _intermediates: &[rustls::pki_types::CertificateDer],
+        _server_name: &rustls::pki_types::ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+[orchestrator/src/k8s_ops.rs]
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use anyhow::Context;
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar, Pod, PodSpec, SecretVolumeSource, Service, ServicePort, ServiceSpec,
+    Volume, VolumeMount,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::api::{DeleteParams, PostParams};
+use kube::{Api, Client};
+use uuid::Uuid;
+
+use crate::redis_ops;
+
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(120);
+const LB_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Azure typically provisions a LoadBalancer IP within 60–90 s; 3 min is a safe ceiling.
+const LB_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+/// All dynamically spawned game servers listen on this port (each gets its own public IP).
+const QUIC_PORT: u16 = 7000;
+
+// ---------------------------------------------------------------------------
+// Config helpers
+// ---------------------------------------------------------------------------
+
+pub fn namespace() -> String {
+    std::env::var("K8S_NAMESPACE").unwrap_or_else(|_| "extraction-mmo".to_string())
+}
+
+fn game_image() -> String {
+    std::env::var("GAME_IMAGE")
+        .unwrap_or_else(|_| "extractionmmoacr.azurecr.io/game-server:latest".to_string())
+}
+
+fn cert_secret_name() -> String {
+    std::env::var("CERT_SECRET_NAME").unwrap_or_else(|_| "extraction-mmo-certs".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// Build an in-cluster Kubernetes client (reads the pod's service-account token).
+/// Falls back to `~/.kube/config` when running outside a cluster (local dev).
+pub async fn connect() -> anyhow::Result<Client> {
+    Client::try_default()
+        .await
+        .context("create Kubernetes client")
+}
+
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
+
+/// Spawn a new game-server Pod + LoadBalancer Service.
+///
+/// Flow:
+/// 1. Create the Service (LoadBalancer, UDP 7000) — ClusterIP is assigned immediately.
+/// 2. Register a Redis placeholder with the ClusterIP as `internal_addr`.
+/// 3. Create the Pod.
+/// 4. Poll until Azure assigns the external LoadBalancer IP (~60–90 s).
+/// 5. Update the Redis `address` field with the real public IP.
+/// 6. Wait for the game server to self-report `status=ready` in Redis.
+pub async fn spawn_server(
+    client: &Client,
+    pool: &deadpool_redis::Pool,
+    is_standby: bool,
+) -> anyhow::Result<String> {
+    let server_id = Uuid::new_v4().to_string();
+    // Pod/Service names must be DNS-safe; use the first 8 hex chars of the UUID.
+    let name = format!("game-{}", &server_id[..8]);
+    let ns = namespace();
+
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://redis:6379".to_string());
+    let gatekeeper_addr = std::env::var("GATEKEEPER_ADDR")
+        .unwrap_or_else(|_| "gatekeeper-quic:3001".to_string());
+
+    // Labels shared by both the Pod and Service (Service selector matches `app`).
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    labels.insert("app".to_string(), name.clone());
+    labels.insert("extraction-mmo/role".to_string(), "game-server".to_string());
+    labels.insert("extraction-mmo/server-id".to_string(), server_id.clone());
+
+    // --- 1. Create LoadBalancer Service ---
+    let services: Api<Service> = Api::namespaced(client.clone(), &ns);
+
+    let mut selector: BTreeMap<String, String> = BTreeMap::new();
+    selector.insert("app".to_string(), name.clone());
+
+    let svc = Service {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            namespace: Some(ns.clone()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("LoadBalancer".to_string()),
+            selector: Some(selector),
+            ports: Some(vec![ServicePort {
+                port: QUIC_PORT as i32,
+                protocol: Some("UDP".to_string()),
+                target_port: Some(IntOrString::Int(QUIC_PORT as i32)),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let created_svc = services
+        .create(&PostParams::default(), &svc)
+        .await
+        .context("create game-server Service")?;
+
+    // ClusterIP is assigned synchronously — use it for internal health checks.
+    let internal_addr = created_svc
+        .spec
+        .as_ref()
+        .and_then(|s| s.cluster_ip.as_deref())
+        .unwrap_or("")
+        .to_string();
+
+    // --- 2. Register Redis placeholder (address will be updated after LB IP is ready) ---
+    redis_ops::register_server(
+        pool,
+        &server_id,
+        &name, // container_id field repurposed to store pod name
+        "pending",
+        &internal_addr,
+        QUIC_PORT,
+        common::constants::DEFAULT_CAPACITY,
+    )
+    .await?;
+
+    // --- 3. Create Pod ---
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            namespace: Some(ns.clone()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![Container {
+                name: "game-server".to_string(),
+                image: Some(game_image()),
+                env: Some(vec![
+                    env_var("SERVER_ID", &server_id),
+                    env_var("QUIC_PORT", &QUIC_PORT.to_string()),
+                    env_var("PUBLIC_ADDR", "pending"), // updated below once LB IP is known
+                    env_var(
+                        "MAX_PLAYERS",
+                        &common::constants::DEFAULT_CAPACITY.to_string(),
+                    ),
+                    env_var("REDIS_URL", &redis_url),
+                    env_var("GATEKEEPER_ADDR", &gatekeeper_addr),
+                ]),
+                volume_mounts: Some(vec![VolumeMount {
+                    name: "certs".to_string(),
+                    mount_path: "/certs".to_string(),
+                    read_only: Some(true),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }],
+            volumes: Some(vec![Volume {
+                name: "certs".to_string(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(cert_secret_name()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    pods.create(&PostParams::default(), &pod)
+        .await
+        .context("create game-server Pod")?;
+
+    tracing::info!(
+        server_id = %server_id,
+        pod = %name,
+        internal_addr = %internal_addr,
+        "Pod and Service created — polling for LoadBalancer IP"
+    );
+
+    // --- 4. Poll for external LoadBalancer IP ---
+    let lb_ip = wait_for_lb_ip(&services, &name)
+        .await
+        .context("waiting for LoadBalancer IP")?;
+
+    tracing::info!(server_id = %server_id, lb_ip = %lb_ip, "LoadBalancer IP assigned");
+
+    // --- 5. Update Redis with the real public IP ---
+    {
+        use deadpool_redis::redis::AsyncCommands;
+        let mut conn = pool.get().await.context("Redis pool")?;
+        let (): () = conn
+            .hset(
+                common::redis_keys::server_key(&server_id),
+                "address",
+                &lb_ip,
+            )
+            .await
+            .context("HSET address")?;
+    }
+
+    // --- 6. Wait for game server to self-report ready ---
+    if let Err(e) = redis_ops::wait_for_ready(pool, &server_id, SPAWN_TIMEOUT).await {
+        tracing::error!(server_id = %server_id, "Server failed to become ready: {e}");
+        let _ = remove_server_k8s(client, &name, &ns).await;
+        redis_ops::remove_server(pool, &server_id).await?;
+        return Err(e);
+    }
+
+    if is_standby {
+        redis_ops::set_standby(pool, &server_id).await?;
+        tracing::info!(server_id = %server_id, "Server registered as standby");
+    }
+
+    Ok(server_id)
+}
+
+/// Delete the Pod and Service for a game server. Ignores not-found errors.
+pub async fn remove_server_k8s(
+    client: &Client,
+    name: &str,
+    ns: &str,
+) -> anyhow::Result<()> {
+    let dp = DeleteParams::default();
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let services: Api<Service> = Api::namespaced(client.clone(), ns);
+    // Ignore errors — the resource may already be gone.
+    let _ = pods.delete(name, &dp).await;
+    let _ = services.delete(name, &dp).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Poll `service.status.loadBalancer.ingress[0].ip` until Azure assigns the IP.
+async fn wait_for_lb_ip(services: &Api<Service>, name: &str) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + LB_POLL_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("Timed out waiting for LoadBalancer IP on Service {name}");
+        }
+
+        let svc = services.get(name).await.context("get Service")?;
+        if let Some(ip) = svc
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_ref())
+            .and_then(|v| v.first())
+            .and_then(|i| i.ip.as_deref())
+            .filter(|ip| !ip.is_empty())
+        {
+            return Ok(ip.to_string());
+        }
+
+        tokio::time::sleep(LB_POLL_INTERVAL).await;
+    }
+}
+
+fn env_var(name: &str, value: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        ..Default::default()
+    }
+}
+
+[orchestrator/src/lib.rs]
+pub fn add(left: u64, right: u64) -> u64 {
+    left + right
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        let result = add(2, 2);
+        assert_eq!(result, 4);
+    }
+}
+
+[orchestrator/src/main.rs]
+mod health;
+mod k8s_ops;
+mod redis_ops;
+
+use std::time::Duration;
+
+use anyhow::Result;
+use tracing::info;
+
+use common::constants::SPAWN_THRESHOLD;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Must be the very first call: kube::Client::try_default() connects to the
+    // K8s API server over TLS, so the crypto provider must be registered first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "orchestrator=info".parse().unwrap()),
+        )
+        .init();
+
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let redis_pool = redis_ops::create_pool(&redis_url);
+    info!("Connected to Redis at {redis_url}");
+
+    let client = k8s_ops::connect().await?;
+    info!("Connected to Kubernetes API");
+
+    // Ensure at least one standby server is running at startup.
+    let standby = redis_ops::get_standby(&redis_pool).await?;
+    if standby.is_none() {
+        info!("No standby server found — spawning one");
+        k8s_ops::spawn_server(&client, &redis_pool, true).await?;
+    }
+
+    let poll_interval = Duration::from_secs(5);
+    let health_interval = Duration::from_secs(10);
+
+    let mut poll_tick = tokio::time::interval(poll_interval);
+    let mut health_tick = tokio::time::interval(health_interval);
+
+    loop {
+        tokio::select! {
+            _ = poll_tick.tick() => {
+                if let Err(e) = run_poll_cycle(&client, &redis_pool).await {
+                    tracing::error!("Poll cycle error: {e}");
+                }
+            }
+            _ = health_tick.tick() => {
+                if let Err(e) = health::run_health_checks(&redis_pool).await {
+                    tracing::error!("Health check error: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// Main 5-second poll: manage standby, scale up on high load, drain empties.
+async fn run_poll_cycle(
+    client: &kube::Client,
+    pool: &deadpool_redis::Pool,
+) -> Result<()> {
+    let servers = redis_ops::list_active_servers(pool).await?;
+
+    // Compute empty_servers first — we derive has_standby from it so the
+    // check is always based on live data, not a potentially-stale Redis key.
+    let empty_servers: Vec<_> = servers
+        .iter()
+        .filter(|s| s.player_count == 0 && s.status != "draining")
+        .collect();
+
+    let has_standby = !empty_servers.is_empty();
+    let needs_scale = servers
+        .iter()
+        .any(|s| s.player_count as f64 / s.capacity as f64 >= SPAWN_THRESHOLD as f64);
+
+    // ── Scale up: spawn a new server when any existing server is ≥ 85% full
+    //    and there is no idle standby.
+    if needs_scale && !has_standby {
+        info!("Load threshold reached — spawning new server");
+        k8s_ops::spawn_server(client, pool, false).await?;
+    }
+
+    // ── Ensure exactly 1 standby (promote the emptiest server if needed).
+    // Exclude servers already being drained so we don't re-drain them every cycle.
+    match empty_servers.len() {
+        0 => {
+            // No idle server at all — spawn a standby if not already scaling
+            // (if we're scaling, the newly spawned server will become the standby).
+            if !needs_scale {
+                info!("No standby server — spawning one");
+                k8s_ops::spawn_server(client, pool, true).await?;
+            }
+        }
+        1 => {
+            // Exactly one idle server — make sure it's tagged as standby.
+            let standby_id = empty_servers[0].id.clone();
+            redis_ops::set_standby(pool, &standby_id).await?;
+        }
+        _ => {
+            // More than one empty server — keep the first as standby, drain rest.
+            redis_ops::set_standby(pool, &empty_servers[0].id).await?;
+            for surplus in &empty_servers[1..] {
+                info!(id = %surplus.id, "Draining surplus empty server");
+                redis_ops::set_status(pool, &surplus.id, "draining").await?;
+                let client_clone = client.clone();
+                let pod_name = surplus.container_id.clone(); // container_id stores pod name
+                let server_id = surplus.id.clone();
+                let pool_clone = pool.clone();
+                let ns = k8s_ops::namespace();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if pod_name.is_empty() {
+                        tracing::warn!(id = %server_id, "No pod name recorded — removing stale Redis entry");
+                    } else if let Err(e) = k8s_ops::remove_server_k8s(&client_clone, &pod_name, &ns).await {
+                        tracing::error!(pod = %pod_name, "Failed to remove pod: {e}");
+                    }
+                    if let Err(e) = redis_ops::remove_server(&pool_clone, &server_id).await {
+                        tracing::error!(id = %server_id, "Failed to remove server from Redis: {e}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+[orchestrator/src/redis_ops.rs]
+use anyhow::Context;
+use deadpool_redis::{Config, Pool, Runtime};
+use deadpool_redis::redis::AsyncCommands;
+
+use common::redis_keys;
+
+pub fn create_pool(url: &str) -> Pool {
+    Config::from_url(url)
+        .create_pool(Some(Runtime::Tokio1))
+        .expect("failed to create Redis pool")
+}
+
+// ---------------------------------------------------------------------------
+// Server info
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    pub id: String,
+    pub container_id: String,
+    pub address: String,
+    /// Docker-internal hostname used by the orchestrator for health checks.
+    pub internal_addr: String,
+    pub quic_port: u16,
+    pub player_count: u32,
+    pub capacity: u32,
+    pub status: String,
+}
+
+/// Return all servers in the active set with their full info.
+pub async fn list_active_servers(pool: &Pool) -> anyhow::Result<Vec<ServerInfo>> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+
+    let ids: Vec<String> = conn
+        .smembers(redis_keys::active_servers_key())
+        .await
+        .context("SMEMBERS servers:active")?;
+
+    let mut out = Vec::with_capacity(ids.len());
+
+    for id in ids {
+        let fields: std::collections::HashMap<String, String> = conn
+            .hgetall(redis_keys::server_key(&id))
+            .await
+            .context("HGETALL")?;
+
+        if fields.is_empty() {
+            continue;
+        }
+
+        out.push(ServerInfo {
+            id: id.clone(),
+            container_id: fields.get("container_id").cloned().unwrap_or_default(),
+            address: fields.get("address").cloned().unwrap_or_default(),
+            internal_addr: fields
+                .get("internal_addr")
+                .cloned()
+                // fall back to address for backwards compat
+                .unwrap_or_else(|| fields.get("address").cloned().unwrap_or_default()),
+            quic_port: fields
+                .get("quic_port")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            player_count: fields
+                .get("player_count")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            capacity: fields
+                .get("capacity")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(common::constants::DEFAULT_CAPACITY),
+            status: fields.get("status").cloned().unwrap_or_default(),
+        });
+    }
+
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Standby management
+// ---------------------------------------------------------------------------
+
+/// Return the ID of the designated standby server, or `None`.
+pub async fn get_standby(pool: &Pool) -> anyhow::Result<Option<String>> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+    let val: Option<String> = conn
+        .get(redis_keys::standby_server_key())
+        .await
+        .context("GET servers:standby")?;
+    Ok(val.filter(|s| !s.is_empty()))
+}
+
+/// Tag a server as the active standby.
+pub async fn set_standby(pool: &Pool, server_id: &str) -> anyhow::Result<()> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+    let (): () = conn
+        .set(redis_keys::standby_server_key(), server_id)
+        .await
+        .context("SET servers:standby")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Server registration (called by orchestrator after spawning a container)
+// ---------------------------------------------------------------------------
+
+pub async fn register_server(
+    pool: &Pool,
+    server_id: &str,
+    container_id: &str,
+    address: &str,
+    internal_addr: &str,
+    quic_port: u16,
+    capacity: u32,
+) -> anyhow::Result<()> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+    let key = redis_keys::server_key(server_id);
+
+    let (): () = conn
+        .hset_multiple(
+            &key,
+            &[
+                ("container_id", container_id.to_string()),
+                ("address", address.to_string()),
+                ("internal_addr", internal_addr.to_string()),
+                ("quic_port", quic_port.to_string()),
+                ("capacity", capacity.to_string()),
+                ("player_count", "0".to_string()),
+                ("status", "starting".to_string()),
+            ],
+        )
+        .await
+        .context("HSET server")?;
+
+    let (): () = conn
+        .sadd(redis_keys::active_servers_key(), server_id)
+        .await
+        .context("SADD servers:active")?;
+
+    Ok(())
+}
+
+/// Update the status field of a server hash.
+pub async fn set_status(pool: &Pool, server_id: &str, status: &str) -> anyhow::Result<()> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+    let (): () = conn
+        .hset(redis_keys::server_key(server_id), "status", status)
+        .await
+        .context("HSET status")?;
+    Ok(())
+}
+
+/// Remove a server from Redis entirely after it has stopped.
+pub async fn remove_server(pool: &Pool, server_id: &str) -> anyhow::Result<()> {
+    let mut conn = pool.get().await.context("Redis pool")?;
+    let key = redis_keys::server_key(server_id);
+    let (): () = conn.del(&key).await.context("DEL server")?;
+    let (): () = conn
+        .srem(redis_keys::active_servers_key(), server_id)
+        .await
+        .context("SREM servers:active")?;
+    Ok(())
+}
+
+/// Poll until the server reports `status=ready`, with a timeout.
+pub async fn wait_for_ready(
+    pool: &Pool,
+    server_id: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("Timed out waiting for server {server_id} to become ready");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let mut conn = pool.get().await.context("Redis pool")?;
+        let status: Option<String> = conn
+            .hget(redis_keys::server_key(server_id), "status")
+            .await
+            .context("HGET status")?;
+
+        if status.as_deref() == Some("ready") {
+            return Ok(());
+        }
+    }
+}
+
+
+[k8s/gatekeeper/deployment.yaml]
+    apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gatekeeper
+  namespace: extraction-mmo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gatekeeper
+  template:
+    metadata:
+      labels:
+        app: gatekeeper
+    spec:
+      serviceAccountName: gatekeeper
+      containers:
+        - name: gatekeeper
+          image: extractionmmoacr.azurecr.io/gatekeeper:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+            - name: quic
+              containerPort: 3001
+              protocol: UDP
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: K8S_NAMESPACE
+              value: "extraction-mmo"
+            - name: CERT_SECRET_NAME
+              value: "extraction-mmo-certs"
+            - name: RUST_LOG
+              value: "info"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+
+[k8s/gatekeeper/rbac.yaml]
+    apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gatekeeper
+  namespace: extraction-mmo
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gatekeeper
+  namespace: extraction-mmo
+subjects:
+  - kind: ServiceAccount
+    name: gatekeeper
+    namespace: extraction-mmo
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: gatekeeper
+
+[k8s/gatekeeper/service-http.yaml]
+    apiVersion: v1
+kind: Service
+metadata:
+  name: gatekeeper-http
+  namespace: extraction-mmo
+spec:
+  type: LoadBalancer
+  selector:
+    app: gatekeeper
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+      protocol: TCP
+
+
+[k8s/gatekeeper/service-quic.yaml]
+    apiVersion: v1
+kind: Service
+metadata:
+  name: gatekeeper-quic
+  namespace: extraction-mmo
+spec:
+  type: ClusterIP
+  selector:
+    app: gatekeeper
+  ports:
+    - name: quic
+      port: 3001
+      targetPort: 3001
+      protocol: UDP
+
+
+[k8s/gatekeeper/serviceaccount.yaml]
+    apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gatekeeper
+  namespace: extraction-mmo
+
+[k8s/orchestrator/deployment.yaml]
+    apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: extraction-mmo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator
+      containers:
+        - name: orchestrator
+          image: extractionmmoacr.azurecr.io/orchestrator:latest
+          imagePullPolicy: Always
+          env:
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            - name: GAME_IMAGE
+              value: "extractionmmoacr.azurecr.io/game-server:latest"
+            - name: K8S_NAMESPACE
+              value: "extraction-mmo"
+            - name: CERT_SECRET_NAME
+              value: "extraction-mmo-certs"
+            - name: GATEKEEPER_ADDR
+              value: "gatekeeper-quic:3001"
+            - name: RUST_LOG
+              value: "info"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+
+[k8s/orchestrator/rbac.yaml]
+    apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator
+  namespace: extraction-mmo
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator
+  namespace: extraction-mmo
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: extraction-mmo
+roleRef:
+  kind: Role
+  apiGroup: rbac.authorization.k8s.io
+  name: orchestrator
+
+
+[k8s/orchestrator/serviceaccount.yaml]
+    apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orchestrator
+  namespace: extraction-mmo
+
+
+[k8s/redis/service.yaml]
+    apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: extraction-mmo
+spec:
+  clusterIP: None   # headless — required by the StatefulSet governing service
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+
+
+[k8s/redis/statefulset.yaml]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: extraction-mmo
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          args: ["--appendonly", "yes"]
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+
+[k8s/namespace.yaml]
+    apiVersion: v1
+kind: Namespace
+metadata:
+  name: extraction-mmo
+
+
+
